@@ -300,19 +300,28 @@ class OpenRouterHelper:
         serialized_size = sum(len(json.dumps(message)) for message in history)
         return len(history), serialized_size
 
-    def _history_for(self, user_id: int, session_id: str) -> list[dict[str, Any]]:
+    def _history_for(
+        self,
+        user_id: int,
+        session_id: str,
+        system_prompt: str | None = None,
+    ) -> list[dict[str, Any]]:
         session_key = (user_id, session_id)
+        effective_system_prompt = system_prompt or str(
+            self.config.get("assistant_prompt") or "You are a helpful assistant."
+        )
         last_updated = self._last_updated.get(session_key)
         max_age = dt.timedelta(minutes=int(self.config.get("max_conversation_age_minutes", 180)))
         if last_updated is not None and dt.datetime.now(dt.UTC) - last_updated > max_age:
+            self.reset_chat_history(user_id, session_id)
+        existing = self._histories.get(session_key)
+        if existing and existing[0].get("content") != effective_system_prompt:
             self.reset_chat_history(user_id, session_id)
         if session_key not in self._histories:
             self._histories[session_key] = [
                 {
                     "role": "system",
-                    "content": str(
-                        self.config.get("assistant_prompt") or "You are a helpful assistant."
-                    ),
+                    "content": effective_system_prompt,
                 }
             ]
         self._last_updated[session_key] = dt.datetime.now(dt.UTC)
@@ -439,12 +448,14 @@ class OpenRouterHelper:
         session_id: str,
         model_id: str,
         content: str | list[dict[str, Any]],
+        *,
+        system_prompt: str | None = None,
     ) -> InferenceResult:
         """Send one non-streaming chat completion."""
         session_key = (user_id, session_id)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         async with lock:
-            history = self._history_for(user_id, session_id)
+            history = self._history_for(user_id, session_id, system_prompt)
             payload = await self._chat_payload(
                 api_key, user_id, model_id, history, content, stream=False
             )
@@ -462,12 +473,14 @@ class OpenRouterHelper:
         session_id: str,
         model_id: str,
         content: str | list[dict[str, Any]],
+        *,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[StreamUpdate]:
         """Stream a text completion, including final OpenRouter cost data."""
         session_key = (user_id, session_id)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         async with lock:
-            history = self._history_for(user_id, session_id)
+            history = self._history_for(user_id, session_id, system_prompt)
             payload = await self._chat_payload(
                 api_key, user_id, model_id, history, content, stream=True
             )

@@ -25,6 +25,7 @@ from openrouter_helper import (
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Update,
@@ -115,6 +116,16 @@ class CatalogView:
     input_modality: str | None = None
 
 
+@dataclass(slots=True)
+class PendingTextBatch:
+    """Consecutive Telegram text chunks waiting to become one model request."""
+
+    update: Update
+    context: ContextTypes.DEFAULT_TYPE
+    parts: list[tuple[int, str]]
+    task: asyncio.Task[None] | None = None
+
+
 class OpenRouterTelegramBot:
     """Telegram bot backed by each user's own OpenRouter API key."""
 
@@ -132,6 +143,8 @@ class OpenRouterTelegramBot:
         self.usage: dict[int | str, UsageTracker] = {}
         self.last_message: dict[tuple[int, str], str] = {}
         self.catalog_views: dict[tuple[int, str], CatalogView] = {}
+        self.pending_text_batches: dict[tuple[int, str, str], PendingTextBatch] = {}
+        self.awaiting_system_prompts: set[tuple[int, str]] = set()
         self.commands = [
             BotCommand("help", "Show commands and setup instructions"),
             BotCommand("key", "Authenticate with your OpenRouter API key"),
@@ -139,6 +152,7 @@ class OpenRouterTelegramBot:
             BotCommand("logout", "Forget your in-memory API key"),
             BotCommand("models", "Browse live OpenRouter chat models"),
             BotCommand("model", "Show or select a chat model"),
+            BotCommand("system", "Set the system prompt for this chat"),
             BotCommand("imagemodels", "Browse live image-generation models"),
             BotCommand("imagemodel", "Show or select an image model"),
             BotCommand("image", "Generate an image with the selected image model"),
@@ -281,9 +295,10 @@ class OpenRouterTelegramBot:
             "OpenRouter Telegram Bot\n\n"
             "1. In this private chat, send /key followed by your OpenRouter API key.\n"
             "2. Use /models and /model provider/model to choose any current chat model.\n"
-            "3. Send text, a supported image, a PDF, a text/code file, or another file "
+            "3. Use /system to set a system prompt for this chat or topic.\n"
+            "4. Send text, a supported image, a PDF, a text/code file, or another file "
             "supported natively by the selected model.\n"
-            "4. Use /imagemodels, /imagemodel, and /image for OpenRouter image generation.\n\n"
+            "5. Use /imagemodels, /imagemodel, and /image for OpenRouter image generation.\n\n"
             "Budget and privacy:\n"
             "• /budget 5 monthly sets a local $5 soft cap; /budget off disables it.\n"
             "• /stats combines exact response costs with your OpenRouter key limit.\n"
@@ -291,7 +306,8 @@ class OpenRouterTelegramBot:
             "• Set keys only in private chat. The bot tries to delete the /key message immediately.\n\n"
             "Model filters: /models image finds vision models; /models file finds native "
             "file-capable models; /models image claude also searches by name. PDFs work "
-            "with any text model through OpenRouter's file parser."
+            "with any text model through OpenRouter's file parser. Consecutive text chunks "
+            "sent within the batching window are combined into one request."
         )
         await self._reply_text(update, text)
 
@@ -554,6 +570,113 @@ class OpenRouterTelegramBot:
             f"Inputs: {', '.join(sorted(model.input_modalities))}",
         )
 
+    def _default_system_prompt(self) -> str:
+        return str(self.openrouter.config.get("assistant_prompt") or "You are a helpful assistant.")
+
+    def _effective_system_prompt(self, update: Update) -> str:
+        custom_prompt = self.state.system_prompt_for(
+            self._user_id(update), self._session_id(update)
+        )
+        return custom_prompt or self._default_system_prompt()
+
+    async def _apply_system_prompt(self, update: Update, prompt: str) -> None:
+        normalized = prompt.strip()
+        maximum = int(self.config["system_prompt_max_chars"])
+        if not normalized:
+            await self._reply_text(update, "The system prompt cannot be empty.")
+            return
+        if len(normalized) > maximum:
+            await self._reply_text(
+                update,
+                f"That system prompt has {len(normalized):,} characters; the configured limit "
+                f"is {maximum:,}.",
+            )
+            return
+        user_id = self._user_id(update)
+        session_id = self._session_id(update)
+        self.state.set_system_prompt(user_id, session_id, normalized)
+        self.openrouter.reset_chat_history(user_id, session_id)
+        await self._reply_text(
+            update, "System prompt saved for this chat. Its conversation history was reset."
+        )
+
+    async def _restore_default_system_prompt(self, update: Update) -> None:
+        user_id = self._user_id(update)
+        session_id = self._session_id(update)
+        self.awaiting_system_prompts.discard((user_id, session_id))
+        self.state.clear_system_prompt(user_id, session_id)
+        self.openrouter.reset_chat_history(user_id, session_id)
+        await self._reply_text(
+            update, "This chat now uses the deployment default system prompt. History was reset."
+        )
+
+    async def system_prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show or change the custom system prompt for this user/chat/topic."""
+        if await self._preflight(update, context, require_key=False, enforce_budget=False) != "":
+            return
+        supplied_prompt = message_text(update.effective_message)
+        if supplied_prompt:
+            command = supplied_prompt.casefold()
+            if command in {"reset", "default", "off"}:
+                await self._restore_default_system_prompt(update)
+            elif command == "cancel":
+                self.awaiting_system_prompts.discard(
+                    (self._user_id(update), self._session_id(update))
+                )
+                await self._reply_text(update, "System-prompt editing cancelled.")
+            else:
+                await self._apply_system_prompt(update, supplied_prompt)
+            return
+
+        custom_prompt = self.state.system_prompt_for(
+            self._user_id(update), self._session_id(update)
+        )
+        current = custom_prompt or self._default_system_prompt()
+        source = "Custom prompt for this chat" if custom_prompt else "Deployment default"
+        visible = current if len(current) <= 3000 else current[:3000] + "\n[…truncated]"
+        markup = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Change prompt", callback_data="systemprompt:set")],
+                [
+                    InlineKeyboardButton(
+                        "Use deployment default", callback_data="systemprompt:reset"
+                    )
+                ],
+            ]
+        )
+        await update.effective_message.reply_text(
+            f"{source}:\n\n{visible}",
+            reply_markup=markup,
+            message_thread_id=get_thread_id(update),
+        )
+
+    async def system_prompt_callback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the per-chat system-prompt controls."""
+        query = update.callback_query
+        if query is None or query.data is None:
+            return
+        await query.answer()
+        session_key = (self._user_id(update), self._session_id(update))
+        if query.data == "systemprompt:reset":
+            self.awaiting_system_prompts.discard(session_key)
+            self.state.clear_system_prompt(*session_key)
+            self.openrouter.reset_chat_history(*session_key)
+            await query.edit_message_text(
+                "This chat now uses the deployment default system prompt. History was reset."
+            )
+            return
+        if query.data != "systemprompt:set" or query.message is None:
+            return
+        self.awaiting_system_prompts.add(session_key)
+        await query.message.reply_text(
+            "Send the new system prompt now. Telegram-split chunks will be joined. "
+            "Use /system cancel to stop.",
+            reply_markup=ForceReply(
+                selective=True, input_field_placeholder="Enter this chat's system prompt"
+            ),
+            message_thread_id=get_thread_id(update),
+        )
+
     async def image_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show or select an exact OpenRouter image-model slug."""
         api_key = await self._preflight(update, context, enforce_budget=False)
@@ -742,31 +865,89 @@ class OpenRouterTelegramBot:
         if self.config["show_usage"]:
             await self._reply_text(update, self._usage_footer(result.usage, result.model).lstrip())
 
+    def _queue_text_batch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        purpose: str,
+    ) -> None:
+        """Debounce consecutive Telegram chunks into one logical message."""
+        user_session = (self._user_id(update), self._session_id(update))
+        batch_key = (*user_session, purpose)
+        message_id = update.effective_message.message_id
+        batch = self.pending_text_batches.get(batch_key)
+        if batch is None:
+            batch = PendingTextBatch(update=update, context=context, parts=[])
+            self.pending_text_batches[batch_key] = batch
+        elif batch.task is not None and not batch.task.done():
+            batch.task.cancel()
+        batch.update = update
+        batch.context = context
+        batch.parts.append((message_id, text))
+        batch.task = context.application.create_task(
+            self._flush_text_batch(batch_key, batch), update=update
+        )
+
+    async def _flush_text_batch(
+        self,
+        batch_key: tuple[int, str, str],
+        batch: PendingTextBatch,
+    ) -> None:
+        await asyncio.sleep(max(0.0, float(self.config["message_batch_window_seconds"])))
+        if self.pending_text_batches.get(batch_key) is not batch:
+            return
+        self.pending_text_batches.pop(batch_key, None)
+        combined = "\n".join(text for _, text in sorted(batch.parts)).strip()
+        if not combined:
+            return
+        user_id, session_id, purpose = batch_key
+        if purpose == "system":
+            self.awaiting_system_prompts.discard((user_id, session_id))
+            await self._apply_system_prompt(batch.update, combined)
+            return
+        self.last_message[(user_id, session_id)] = combined
+        await self._infer(batch.update, batch.context, combined)
+
     async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a Telegram text message to the selected OpenRouter model."""
+        """Queue a Telegram text message for one debounced OpenRouter request."""
         if update.edited_message or not update.message or update.message.via_bot:
             return
         prompt = message_text(update.message)
+        session_key = (self._user_id(update), self._session_id(update))
+        entering_system_prompt = session_key in self.awaiting_system_prompts
         if is_group_chat(update):
             trigger = str(self.config["group_trigger_keyword"])
             is_chat_command = bool(
                 update.message.text and update.message.text.lower().startswith("/chat")
             )
-            if trigger and prompt.lower().startswith(trigger.lower()):
+            is_split_continuation = (*session_key, "prompt") in self.pending_text_batches
+            if entering_system_prompt:
+                pass
+            elif trigger and prompt.lower().startswith(trigger.lower()):
                 prompt = prompt[len(trigger) :].strip()
-            elif not is_chat_command and not (
-                update.message.reply_to_message
-                and update.message.reply_to_message.from_user
-                and update.message.reply_to_message.from_user.id == context.bot.id
+            elif (
+                not is_chat_command
+                and not is_split_continuation
+                and not (
+                    update.message.reply_to_message
+                    and update.message.reply_to_message.from_user
+                    and update.message.reply_to_message.from_user.id == context.bot.id
+                )
             ):
                 return
-            if update.message.reply_to_message and update.message.reply_to_message.text:
+            if (
+                not entering_system_prompt
+                and not is_split_continuation
+                and update.message.reply_to_message
+                and update.message.reply_to_message.text
+            ):
                 prompt = f"Quoted message:\n{update.message.reply_to_message.text}\n\n{prompt}"
         if not prompt:
             await self._reply_text(update, "Send some text after /chat.")
             return
-        self.last_message[(self._user_id(update), self._session_id(update))] = prompt
-        await self._infer(update, context, prompt)
+        purpose = "system" if entering_system_prompt else "prompt"
+        self._queue_text_batch(update, context, prompt, purpose)
 
     async def photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Send a Telegram photo/image document to a vision-capable model."""
@@ -831,9 +1012,13 @@ class OpenRouterTelegramBot:
             media = await context.bot.get_file(document.file_id)
             data = bytes(await media.download_as_bytearray())
             self._check_file_size(data)
-            prompt = update.effective_message.caption or f"Analyze the attached file {filename}."
+            prompt = update.effective_message.caption or (
+                f"Read and analyze the attached file {filename}. Give a substantive text response."
+            )
             if self._is_text_document(filename, mime_type):
                 decoded = data.decode("utf-8-sig")
+                if not decoded.strip():
+                    raise ValueError("The uploaded text file is empty.")
                 max_chars = int(self.config["text_file_max_chars"])
                 if len(decoded) > max_chars:
                     raise ValueError(
@@ -853,7 +1038,7 @@ class OpenRouterTelegramBot:
                         "Use /models file, or upload PDF/text/code instead."
                     )
                 content = file_content(data, filename, mime_type, prompt)
-            await self._infer(update, context, content, api_key=api_key)
+            await self._infer(update, context, content, api_key=api_key, force_non_streaming=True)
         except UnicodeDecodeError:
             await self._reply_text(
                 update,
@@ -870,12 +1055,14 @@ class OpenRouterTelegramBot:
         content: str | list[dict[str, Any]],
         *,
         api_key: str | None = None,
+        force_non_streaming: bool = False,
     ) -> None:
         if api_key is None:
             api_key = await self._preflight(update, context)
             if api_key is None:
                 return
         model_id = self.state.preferences_for(self._user_id(update)).model
+        system_prompt = self._effective_system_prompt(update)
         await update.effective_chat.send_action(
             constants.ChatAction.TYPING, message_thread_id=get_thread_id(update)
         )
@@ -883,8 +1070,10 @@ class OpenRouterTelegramBot:
             contains_file = isinstance(content, list) and any(
                 part.get("type") == "file" for part in content
             )
-            if self.config["stream"] and not contains_file:
-                final = await self._stream_response(update, api_key, model_id, content)
+            if self.config["stream"] and not contains_file and not force_non_streaming:
+                final = await self._stream_response(
+                    update, api_key, model_id, content, system_prompt
+                )
                 self._record_usage(update, final.usage, final.model or model_id)
             else:
                 result = await self.openrouter.chat(
@@ -893,6 +1082,7 @@ class OpenRouterTelegramBot:
                     self._session_id(update),
                     model_id,
                     content,
+                    system_prompt=system_prompt,
                 )
                 await self._reply_text(
                     update, result.text + self._usage_footer(result.usage, result.model or model_id)
@@ -910,6 +1100,7 @@ class OpenRouterTelegramBot:
         api_key: str,
         model_id: str,
         content: str | list[dict[str, Any]],
+        system_prompt: str,
     ) -> StreamUpdate:
         sent_message = None
         last_edit = ""
@@ -920,6 +1111,7 @@ class OpenRouterTelegramBot:
             self._session_id(update),
             model_id,
             content,
+            system_prompt=system_prompt,
         ):
             if stream_update.done:
                 final_update = stream_update
@@ -969,6 +1161,16 @@ class OpenRouterTelegramBot:
 
     async def post_shutdown(self, _: Application) -> None:
         """Release OpenRouter HTTP connections during shutdown."""
+        tasks = [
+            batch.task
+            for batch in self.pending_text_batches.values()
+            if batch.task is not None and not batch.task.done()
+        ]
+        self.pending_text_batches.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.openrouter.close()
 
     async def error_handler(self, _: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -997,6 +1199,7 @@ class OpenRouterTelegramBot:
         application.add_handler(CommandHandler("logout", self.logout))
         application.add_handler(CommandHandler("models", self.models))
         application.add_handler(CommandHandler("model", self.model))
+        application.add_handler(CommandHandler("system", self.system_prompt))
         application.add_handler(CommandHandler("imagemodels", self.image_models))
         application.add_handler(CommandHandler("imagemodel", self.image_model))
         application.add_handler(CommandHandler("image", self.image))
@@ -1014,6 +1217,11 @@ class OpenRouterTelegramBot:
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.prompt))
         application.add_handler(
             CallbackQueryHandler(self.model_callback, pattern=r"^model(?:pick|page):[ti]:\d+$")
+        )
+        application.add_handler(
+            CallbackQueryHandler(
+                self.system_prompt_callback, pattern=r"^systemprompt:(?:set|reset)$"
+            )
         )
         application.add_error_handler(self.error_handler)
         return application

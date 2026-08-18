@@ -53,6 +53,10 @@ def build_config() -> tuple[dict[str, Any], dict[str, Any]]:
         "ignore_group_attachments": _as_bool("IGNORE_GROUP_ATTACHMENTS", True),
         "max_file_size_mb": int(os.environ.get("MAX_FILE_SIZE_MB", "10")),
         "text_file_max_chars": int(os.environ.get("TEXT_FILE_MAX_CHARS", "200000")),
+        "system_prompt_max_chars": int(os.environ.get("SYSTEM_PROMPT_MAX_CHARS", "12000")),
+        "message_batch_window_seconds": float(
+            os.environ.get("MESSAGE_BATCH_WINDOW_SECONDS", "1.25")
+        ),
         "settings_path": Path(os.environ.get("USER_SETTINGS_PATH", "user_data/settings.json")),
         "usage_logs_dir": os.environ.get("USAGE_LOGS_DIR", "usage_logs"),
     }
@@ -76,6 +80,10 @@ def main() -> None:
         raise SystemExit("BUDGET_PERIOD must be daily, monthly, or all-time")
     if openrouter_config["pdf_engine"] not in {"cloudflare-ai", "mistral-ocr", "native"}:
         raise SystemExit("OPENROUTER_PDF_ENGINE must be cloudflare-ai, mistral-ocr, or native")
+    if telegram_config["system_prompt_max_chars"] <= 0:
+        raise SystemExit("SYSTEM_PROMPT_MAX_CHARS must be greater than zero")
+    if telegram_config["message_batch_window_seconds"] < 0:
+        raise SystemExit("MESSAGE_BATCH_WINDOW_SECONDS cannot be negative")
 
     state = UserStateStore(
         settings_path=telegram_config["settings_path"],

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ class UserPreferences:
     image_model: str | None = None
     budget_limit: float | None = None
     budget_period: str = "monthly"
+    chat_system_prompts: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any], default_model: str) -> UserPreferences:
@@ -29,11 +30,22 @@ class UserPreferences:
             period = "monthly"
         raw_limit = value.get("budget_limit")
         limit = float(raw_limit) if raw_limit is not None else None
+        raw_prompts = value.get("chat_system_prompts")
+        prompts = (
+            {
+                str(session_id): prompt
+                for session_id, prompt in raw_prompts.items()
+                if isinstance(prompt, str) and prompt.strip()
+            }
+            if isinstance(raw_prompts, dict)
+            else {}
+        )
         return cls(
             model=str(value.get("model") or default_model),
             image_model=value.get("image_model") or None,
             budget_limit=limit,
             budget_period=period,
+            chat_system_prompts=prompts,
         )
 
 
@@ -70,7 +82,7 @@ class UserStateStore:
     def _save(self) -> None:
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "users": {
                 str(user_id): asdict(preferences)
                 for user_id, preferences in self._preferences.items()
@@ -130,4 +142,27 @@ class UserStateStore:
         """Disable the user's local soft spending cap."""
         with self._lock:
             self.preferences_for(user_id).budget_limit = None
+            self._save()
+
+    def system_prompt_for(self, user_id: int, session_id: str) -> str | None:
+        """Return the custom system prompt for one user/chat/topic."""
+        with self._lock:
+            prompts = self.preferences_for(user_id).chat_system_prompts
+            return prompts.get(session_id)
+
+    def set_system_prompt(self, user_id: int, session_id: str, prompt: str) -> None:
+        """Persist a custom system prompt for one user/chat/topic."""
+        normalized = prompt.strip()
+        if not normalized:
+            raise ValueError("System prompt cannot be empty")
+        with self._lock:
+            preferences = self.preferences_for(user_id)
+            preferences.chat_system_prompts[session_id] = normalized
+            self._save()
+
+    def clear_system_prompt(self, user_id: int, session_id: str) -> None:
+        """Restore the deployment default system prompt for one chat/topic."""
+        with self._lock:
+            prompts = self.preferences_for(user_id).chat_system_prompts
+            prompts.pop(session_id, None)
             self._save()

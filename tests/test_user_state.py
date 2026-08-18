@@ -67,3 +67,25 @@ def test_corrupt_settings_fall_back_to_defaults(tmp_path: Path) -> None:
     settings_path.write_text("not-json", encoding="utf-8")
     state = UserStateStore(settings_path, "openrouter/auto")
     assert state.preferences_for(9).model == "openrouter/auto"
+
+
+def test_system_prompts_are_persisted_per_user_chat_and_topic(tmp_path: Path) -> None:
+    """Custom instructions should be isolated by conversation session."""
+    settings_path = tmp_path / "settings.json"
+    state = UserStateStore(settings_path, "openrouter/auto")
+    state.set_system_prompt(4, "100:0", "Be concise.")
+    state.set_system_prompt(4, "100:8", "Explain everything in detail.")
+
+    restarted = UserStateStore(settings_path, "openrouter/auto")
+    assert restarted.system_prompt_for(4, "100:0") == "Be concise."
+    assert restarted.system_prompt_for(4, "100:8") == "Explain everything in detail."
+
+    restarted.clear_system_prompt(4, "100:0")
+    assert restarted.system_prompt_for(4, "100:0") is None
+    assert restarted.system_prompt_for(4, "100:8") == "Explain everything in detail."
+
+
+def test_system_prompt_rejects_empty_text(tmp_path: Path) -> None:
+    state = UserStateStore(tmp_path / "settings.json", "openrouter/auto")
+    with pytest.raises(ValueError, match="cannot be empty"):
+        state.set_system_prompt(4, "100:0", "   ")

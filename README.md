@@ -14,6 +14,8 @@ The bot does not require a shared inference key. User keys are validated against
 - UTF-8 text, source code, JSON, CSV, Markdown, XML, YAML, and similar files embedded as text for any text model.
 - Other file types sent to models that advertise native `file` input support.
 - Streaming Telegram responses.
+- Per-user, per-chat/topic system prompts managed with `/system` and inline buttons.
+- Debounced text batching so Telegram-split long messages produce one model response.
 - Exact per-request cost accounting from OpenRouter's returned `usage.cost`, not a static token-price estimate.
 - Per-user local soft budgets plus deployment-wide budgets and OpenRouter key-limit reporting.
 - Access controls for private and group chats.
@@ -26,9 +28,11 @@ The bot does not require a shared inference key. User keys are validated against
 | `/key` | Validates the bearer token with [`GET /api/v1/key`](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key). |
 | `/models`, `/model` | Fetches current text-output models and their input modalities, context size, supported parameters, and pricing from the [Models API](https://openrouter.ai/docs/guides/overview/models). |
 | Text message | Sends the selected model and conversation to `/api/v1/chat/completions`. Only optional parameters advertised in `supported_parameters` are included. |
+| `/system` | Stores a system prompt for the current user/chat/topic and sends it as the leading `system` message. Changing it resets that conversation's history. |
+| Split text message | Joins consecutive chunks received within `MESSAGE_BATCH_WINDOW_SECONDS` and makes one completion request. |
 | Telegram photo | Sends text first, then an `image_url` base64 data URL. The selected model must advertise `image` input. |
 | PDF | Sends a `file` content part. PDFs work with any OpenRouter text model because OpenRouter can parse them before inference. |
-| Text/code file | Decodes UTF-8 locally and sends it as text, allowing any text model to analyze it. |
+| Text/code file | Decodes UTF-8 locally and sends it through a complete, non-streaming request, allowing any text model to analyze it reliably. |
 | Other file | Sends a `file` content part only when the selected model advertises native `file` input. |
 | `/imagemodels`, `/image` | Discovers image-output models and sends generation requests to `POST /api/v1/images`. |
 | `/stats`, budgets | Records the native token counts and actual cost in the final normal response or final streaming SSE event, as documented in [Usage Accounting](https://openrouter.ai/docs/cookbook/administration/usage-accounting). |
@@ -84,6 +88,9 @@ Use the exact model slug shown by `/models`; model availability changes over tim
 | `/logout` | Forget the in-memory key and clear the user's in-memory conversations. |
 | `/models [input] [search]` | Browse current text-output models. Optional input is `text`, `image`, `file`, `audio`, or `video`. |
 | `/model [provider/model]` | Show or select the current chat model. Model changes reset conversation history. |
+| `/system` | Show this chat/topic's system prompt and buttons to change or restore it. |
+| `/system PROMPT` | Set the system prompt directly and reset this conversation's history. |
+| `/system reset` | Restore the deployment default for this chat/topic. |
 | `/imagemodels [search]` | Browse current image-output models. |
 | `/imagemodel [provider/model]` | Show or select the image-generation model. |
 | `/image PROMPT` | Generate one image using the selected image model. |
@@ -115,6 +122,16 @@ PDFs are sent as base64 `data:application/pdf` file parts. The default parser is
 
 Known text MIME types and common code/data extensions are decoded as UTF-8 and wrapped with filename boundaries in the prompt. `TEXT_FILE_MAX_CHARS` limits the decoded content before it is sent.
 
+Text/code attachments deliberately use a complete non-streaming completion even when normal chat streaming is enabled. This avoids provider-specific streaming gaps for very large embedded text prompts. Empty files are rejected with an explicit message.
+
+## Per-chat system prompts and split messages
+
+Run `/system` to view the effective prompt for the current private chat, group conversation, or forum topic. The **Change prompt** button asks for new instructions directly in Telegram; `/system PROMPT` is the equivalent one-line shortcut. The prompt is scoped to both the Telegram user and chat/topic, so changing it does not affect the user's other conversations. Changing or restoring it clears only that conversation's in-memory history.
+
+Custom system prompts persist in `user_data/settings.json`. They are plain text, not secrets, so do not place API keys or other credentials in them. `SYSTEM_PROMPT_MAX_CHARS` controls their maximum size.
+
+Telegram can deliver a long composition as several consecutive messages. The bot now waits `MESSAGE_BATCH_WINDOW_SECONDS` after each text chunk and resets that timer when another arrives from the same user/chat/topic. All chunks in that window are ordered by Telegram message ID, joined with newlines, and sent as one model request. The default 1.25-second window adds a small delay to normal text messages; set it lower to reduce latency or to `0` to effectively disable waiting.
+
 ### Other files
 
 Non-PDF binary files are accepted only if the chosen model advertises `file` in `architecture.input_modalities`. Use `/models file` to browse them. Provider support still varies; an OpenRouter/provider error is returned to Telegram if the specific file format is rejected.
@@ -141,6 +158,7 @@ Bot-side budgets are pre-request soft caps. Because the final cost is known only
 - Keys exist only in process memory. They are not stored in `user_data/settings.json`, `usage_logs`, logs, Docker volumes, or command lines. Users must authenticate again after a restart or redeployment.
 - `/logout` removes the key and the user's in-memory conversation history.
 - Non-secret model preferences and local-budget settings persist in `user_data`; exact daily costs and tokens persist in `usage_logs`.
+- Custom system prompts also persist in `user_data` as plain text; never include credentials in them.
 - Prompts and attachments are sent to OpenRouter and the selected inference provider. Review OpenRouter's [data collection](https://openrouter.ai/docs/guides/privacy/data-collection) and provider-logging documentation for the account's privacy configuration.
 - Set `ALLOWED_TELEGRAM_USER_IDS` for private deployments. An unrestricted public bot can be abused even though users supply their own inference keys.
 
@@ -195,6 +213,8 @@ OpenRouter documents `HTTP-Referer` and `X-Title` as optional headers in its [qu
 | `IGNORE_GROUP_ATTACHMENTS` | `true` | Ignore images/files in groups unless explicitly disabled. |
 | `MAX_FILE_SIZE_MB` | `10` | Maximum attachment size downloaded and sent to OpenRouter. |
 | `TEXT_FILE_MAX_CHARS` | `200000` | Maximum decoded UTF-8 characters per text/code file. |
+| `SYSTEM_PROMPT_MAX_CHARS` | `12000` | Maximum custom system-prompt length per user/chat/topic. |
+| `MESSAGE_BATCH_WINDOW_SECONDS` | `1.25` | Quiet window used to join Telegram-split text into one request; `0` disables the delay. |
 | `PROXY` | empty | Shared Telegram and OpenRouter proxy. |
 | `TELEGRAM_PROXY` | empty | Telegram-only proxy when `PROXY` is unset. |
 | `USER_SETTINGS_PATH` | `user_data/settings.json` | Non-secret preferences file. |
@@ -227,10 +247,12 @@ Before treating a deployment as complete, verify on the actual host:
 2. The bot starts without exposing the Telegram token in logs.
 3. A limited test key authenticates through `/key` and its Telegram message is deleted.
 4. `/models image` returns live models and button selection updates `/model`.
-5. One text request, one image-understanding request, one text file, and one PDF succeed with the selected model.
-6. `/stats` cost matches the OpenRouter Activity page for those requests.
-7. A deliberately tiny local budget blocks the next request, and the OpenRouter key's hard limit is also configured as intended.
-8. Restarting the container requires `/key` again while model preferences and usage totals remain.
+5. `/system` changes the current chat's behavior, resets its history, and leaves another chat's prompt unchanged.
+6. Several rapid text chunks produce one response, while messages sent outside the batching window remain separate.
+7. One text request, one image-understanding request, one text file, and one PDF succeed with the selected model.
+8. `/stats` cost matches the OpenRouter Activity page for those requests.
+9. A deliberately tiny local budget blocks the next request, and the OpenRouter key's hard limit is also configured as intended.
+10. Restarting the container requires `/key` again while model preferences, custom system prompts, and usage totals remain.
 
 Local unit tests can validate request construction and accounting, but they cannot prove Telegram delivery, provider-specific file acceptance, a real model response, or host filesystem permissions without live credentials.
 

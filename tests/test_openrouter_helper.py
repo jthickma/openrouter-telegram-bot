@@ -185,6 +185,54 @@ async def test_pdf_chat_uses_parser_and_actual_usage_cost() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_uses_and_refreshes_a_per_session_system_prompt() -> None:
+    """A changed per-chat system prompt should replace stale conversation history."""
+    captured_messages: list[list[dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/models":
+            return httpx.Response(200, json={"data": [model_payload()]})
+        if request.url.path == "/api/v1/chat/completions":
+            captured_messages.append(json.loads(request.content)["messages"])
+            return httpx.Response(
+                200,
+                json={
+                    "model": "vendor/text-model",
+                    "choices": [{"message": {"role": "assistant", "content": "Done."}}],
+                    "usage": {"total_tokens": 4, "cost": 0.001},
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    helper = helper_with_transport(httpx.MockTransport(handler))
+    try:
+        await helper.chat(
+            "sk-or-test",
+            1,
+            "100:0",
+            "vendor/text-model",
+            "First",
+            system_prompt="Be concise.",
+        )
+        await helper.chat(
+            "sk-or-test",
+            1,
+            "100:0",
+            "vendor/text-model",
+            "Second",
+            system_prompt="Answer as a pirate.",
+        )
+
+        assert captured_messages[0][0] == {"role": "system", "content": "Be concise."}
+        assert captured_messages[1] == [
+            {"role": "system", "content": "Answer as a pirate."},
+            {"role": "user", "content": "Second"},
+        ]
+    finally:
+        await helper.close()
+
+
+@pytest.mark.asyncio
 async def test_model_catalog_filters_search_and_uses_cache() -> None:
     """Catalog filtering should happen locally after one live API request."""
     request_count = 0
