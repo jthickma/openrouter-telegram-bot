@@ -1,7 +1,13 @@
 __pycache__
+.coverage
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
 /.idea
 .env
 .DS_Store
 /usage_logs
+/user_data
 venv
 /.cache

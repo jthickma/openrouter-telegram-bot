@@ -1,1083 +1,1024 @@
+"""Telegram handlers for per-user OpenRouter inference."""
+
 from __future__ import annotations
 
 import asyncio
-import logging
-import os
+import contextlib
 import io
+import logging
+import math
+import mimetypes
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from uuid import uuid4
-from telegram import BotCommandScopeAllGroupChats, Update, constants
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, InlineQueryResultArticle
-from telegram import InputTextMessageContent, BotCommand
-from telegram.error import RetryAfter, TimedOut, BadRequest
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, \
-    filters, InlineQueryHandler, CallbackQueryHandler, Application, ContextTypes, CallbackContext
-
-from pydub import AudioSegment
-from PIL import Image
-
-from utils import is_group_chat, get_thread_id, message_text, wrap_with_indicator, split_into_chunks, \
-    edit_message_with_retry, get_stream_cutoff_values, is_allowed, get_remaining_budget, is_admin, is_within_budget, \
-    get_reply_to_message_id, add_chat_request_to_usage_tracker, error_handler, is_direct_result, handle_direct_result, \
-    cleanup_intermediate_files
-from openai_helper import OpenAIHelper, localized_text
+from openrouter_helper import (
+    ImageGenerationResult,
+    ModelInfo,
+    OpenRouterError,
+    OpenRouterHelper,
+    StreamUpdate,
+    UsageInfo,
+    file_content,
+    image_content,
+)
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    constants,
+)
+from telegram.error import BadRequest, RetryAfter, TelegramError, TimedOut
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from usage_tracker import UsageTracker
+from user_state import VALID_BUDGET_PERIODS, UserStateStore
+from utils import (
+    get_reply_to_message_id,
+    get_thread_id,
+    is_admin,
+    is_allowed,
+    is_group_chat,
+    message_text,
+    split_into_chunks,
+)
+
+TEXT_MIME_TYPES = frozenset(
+    {
+        "application/json",
+        "application/ld+json",
+        "application/javascript",
+        "application/sql",
+        "application/toml",
+        "application/xml",
+        "application/x-httpd-php",
+        "application/x-sh",
+        "application/x-yaml",
+    }
+)
+TEXT_EXTENSIONS = frozenset(
+    {
+        ".c",
+        ".cfg",
+        ".conf",
+        ".cpp",
+        ".cs",
+        ".css",
+        ".csv",
+        ".env",
+        ".go",
+        ".h",
+        ".html",
+        ".ini",
+        ".java",
+        ".js",
+        ".json",
+        ".jsx",
+        ".kt",
+        ".log",
+        ".lua",
+        ".md",
+        ".php",
+        ".properties",
+        ".py",
+        ".rb",
+        ".rs",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
-class ChatGPTTelegramBot:
-    """
-    Class representing a ChatGPT Telegram Bot.
-    """
+@dataclass(slots=True)
+class CatalogView:
+    """The last model catalog shown to a Telegram user."""
 
-    def __init__(self, config: dict, openai: OpenAIHelper):
-        """
-        Initializes the bot with the given configuration and GPT bot object.
-        :param config: A dictionary containing the bot configuration
-        :param openai: OpenAIHelper object
-        """
+    kind: str
+    models: list[ModelInfo]
+    query: str
+    input_modality: str | None = None
+
+
+class OpenRouterTelegramBot:
+    """Telegram bot backed by each user's own OpenRouter API key."""
+
+    MODEL_PAGE_SIZE = 8
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        openrouter: OpenRouterHelper,
+        state: UserStateStore,
+    ) -> None:
         self.config = config
-        self.openai = openai
-        bot_language = self.config['bot_language']
+        self.openrouter = openrouter
+        self.state = state
+        self.usage: dict[int | str, UsageTracker] = {}
+        self.last_message: dict[tuple[int, str], str] = {}
+        self.catalog_views: dict[tuple[int, str], CatalogView] = {}
         self.commands = [
-            BotCommand(command='help', description=localized_text('help_description', bot_language)),
-            BotCommand(command='reset', description=localized_text('reset_description', bot_language)),
-            BotCommand(command='stats', description=localized_text('stats_description', bot_language)),
-            BotCommand(command='resend', description=localized_text('resend_description', bot_language))
+            BotCommand("help", "Show commands and setup instructions"),
+            BotCommand("key", "Authenticate with your OpenRouter API key"),
+            BotCommand("keyinfo", "Show OpenRouter key usage and limits"),
+            BotCommand("logout", "Forget your in-memory API key"),
+            BotCommand("models", "Browse live OpenRouter chat models"),
+            BotCommand("model", "Show or select a chat model"),
+            BotCommand("imagemodels", "Browse live image-generation models"),
+            BotCommand("imagemodel", "Show or select an image model"),
+            BotCommand("image", "Generate an image with the selected image model"),
+            BotCommand("budget", "Set or inspect a local spending cap"),
+            BotCommand("stats", "Show exact OpenRouter usage and cost"),
+            BotCommand("reset", "Reset this conversation"),
+            BotCommand("resend", "Repeat your last text prompt"),
         ]
-        # If imaging is enabled, add the "image" command to the list
-        if self.config.get('enable_image_generation', False):
-            self.commands.append(BotCommand(command='image', description=localized_text('image_description', bot_language)))
+        self.group_commands = [BotCommand("chat", "Ask the bot in this group")] + self.commands
 
-        if self.config.get('enable_tts_generation', False):
-            self.commands.append(BotCommand(command='tts', description=localized_text('tts_description', bot_language)))
+    @staticmethod
+    def _user_id(update: Update) -> int:
+        if update.effective_user is None:
+            raise ValueError("Telegram update has no user")
+        return update.effective_user.id
 
-        self.group_commands = [BotCommand(
-            command='chat', description=localized_text('chat_description', bot_language)
-        )] + self.commands
-        self.disallowed_message = localized_text('disallowed', bot_language)
-        self.budget_limit_message = localized_text('budget_limit', bot_language)
-        self.usage = {}
-        self.last_message = {}
-        self.inline_queries_cache = {}
+    @staticmethod
+    def _session_id(update: Update) -> str:
+        if update.effective_chat is None:
+            raise ValueError("Telegram update has no chat")
+        return f"{update.effective_chat.id}:{get_thread_id(update) or 0}"
+
+    def _tracker(self, update: Update) -> UsageTracker:
+        user_id = self._user_id(update)
+        if user_id not in self.usage:
+            name = update.effective_user.name if update.effective_user else str(user_id)
+            self.usage[user_id] = UsageTracker(
+                user_id, name, logs_dir=str(self.config["usage_logs_dir"])
+            )
+        return self.usage[user_id]
+
+    def _guest_tracker(self) -> UsageTracker:
+        if "guests" not in self.usage:
+            self.usage["guests"] = UsageTracker(
+                "guests",
+                "all guest users in group chats",
+                logs_dir=str(self.config["usage_logs_dir"]),
+            )
+        return self.usage["guests"]
+
+    def _is_guest(self, user_id: int) -> bool:
+        allowed = str(self.config["allowed_user_ids"])
+        return allowed != "*" and str(user_id) not in allowed.split(",")
+
+    def _server_budget(self, user_id: int) -> float:
+        if is_admin(self.config, user_id) or self.config["user_budgets"] == "*":
+            return math.inf
+        budgets = str(self.config["user_budgets"]).split(",")
+        allowed = str(self.config["allowed_user_ids"])
+        if allowed == "*":
+            return float(budgets[0])
+        allowed_ids = allowed.split(",")
+        if str(user_id) in allowed_ids:
+            index = allowed_ids.index(str(user_id))
+            return float(budgets[index]) if index < len(budgets) else 0.0
+        return float(self.config["guest_budget"])
+
+    def _remaining_budgets(self, update: Update) -> tuple[float, float]:
+        user_id = self._user_id(update)
+        tracker = self._tracker(update)
+        server_limit = self._server_budget(user_id)
+        if self._is_guest(user_id):
+            server_spend = self._guest_tracker().get_cost_for_period(self.config["budget_period"])
+        else:
+            server_spend = tracker.get_cost_for_period(self.config["budget_period"])
+        server_remaining = server_limit - server_spend
+
+        preferences = self.state.preferences_for(user_id)
+        if preferences.budget_limit is None:
+            personal_remaining = math.inf
+        else:
+            personal_remaining = preferences.budget_limit - tracker.get_cost_for_period(
+                preferences.budget_period
+            )
+        return server_remaining, personal_remaining
+
+    async def _preflight(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        require_key: bool = True,
+        enforce_budget: bool = True,
+    ) -> str | None:
+        if not await is_allowed(self.config, update, context):
+            await update.effective_message.reply_text(
+                "You are not allowed to use this bot.",
+                message_thread_id=get_thread_id(update),
+            )
+            return None
+        if enforce_budget:
+            server_remaining, personal_remaining = self._remaining_budgets(update)
+            if server_remaining <= 0 or personal_remaining <= 0:
+                await update.effective_message.reply_text(
+                    "Your configured spending budget has been reached. Use /budget to inspect it.",
+                    message_thread_id=get_thread_id(update),
+                )
+                return None
+        if not require_key:
+            return ""
+        api_key = self.state.get_api_key(self._user_id(update))
+        if api_key is None:
+            await update.effective_message.reply_text(
+                "Authenticate first in a private chat with /key YOUR_OPENROUTER_API_KEY. "
+                "The key is kept only in memory and must be re-entered after a restart.",
+                message_thread_id=get_thread_id(update),
+            )
+            return None
+        return api_key
+
+    def _record_usage(self, update: Update, usage: UsageInfo, model: str) -> None:
+        user_id = self._user_id(update)
+        self._tracker(update).add_openrouter_usage(usage.total_tokens, usage.cost, model)
+        if self._is_guest(user_id):
+            self._guest_tracker().add_openrouter_usage(usage.total_tokens, usage.cost, model)
+
+    def _usage_footer(self, usage: UsageInfo, model: str) -> str:
+        if not self.config["show_usage"]:
+            return ""
+        return (
+            f"\n\n—\n{model or 'OpenRouter'} • {usage.total_tokens:,} tokens • "
+            f"${usage.cost:.6f}"
+        )
+
+    async def _reply_text(self, update: Update, text: str) -> None:
+        chunks = split_into_chunks(text or "(empty response)")
+        for index, chunk in enumerate(chunks):
+            await update.effective_message.reply_text(
+                chunk,
+                message_thread_id=get_thread_id(update),
+                reply_to_message_id=(
+                    get_reply_to_message_id(self.config, update) if index == 0 else None
+                ),
+                disable_web_page_preview=True,
+            )
 
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        Shows the help menu.
-        """
-        commands = self.group_commands if is_group_chat(update) else self.commands
-        commands_description = [f'/{command.command} - {command.description}' for command in commands]
-        bot_language = self.config['bot_language']
-        help_text = (
-                localized_text('help_text', bot_language)[0] +
-                '\n\n' +
-                '\n'.join(commands_description) +
-                '\n\n' +
-                localized_text('help_text', bot_language)[1] +
-                '\n\n' +
-                localized_text('help_text', bot_language)[2]
+        """Show user workflow and commands."""
+        text = (
+            "OpenRouter Telegram Bot\n\n"
+            "1. In this private chat, send /key followed by your OpenRouter API key.\n"
+            "2. Use /models and /model provider/model to choose any current chat model.\n"
+            "3. Send text, a supported image, a PDF, a text/code file, or another file "
+            "supported natively by the selected model.\n"
+            "4. Use /imagemodels, /imagemodel, and /image for OpenRouter image generation.\n\n"
+            "Budget and privacy:\n"
+            "• /budget 5 monthly sets a local $5 soft cap; /budget off disables it.\n"
+            "• /stats combines exact response costs with your OpenRouter key limit.\n"
+            "• Keys stay in process memory only and are lost on restart. /logout forgets yours.\n"
+            "• Set keys only in private chat. The bot tries to delete the /key message immediately.\n\n"
+            "Model filters: /models image finds vision models; /models file finds native "
+            "file-capable models; /models image claude also searches by name. PDFs work "
+            "with any text model through OpenRouter's file parser."
         )
-        await update.message.reply_text(help_text, disable_web_page_preview=True)
+        await self._reply_text(update, text)
 
-    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Returns token usage statistics for current day and month.
-        """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
-                            'is not allowed to request their usage statistics')
-            await self.send_disallowed_message(update, context)
+    async def set_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Validate and keep a user's OpenRouter API key only in memory."""
+        if await self._preflight(update, context, require_key=False, enforce_budget=False) != "":
             return
-
-        logging.info(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
-                     'requested their usage statistics')
-
-        user_id = update.message.from_user.id
-        if user_id not in self.usage:
-            self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
-
-        tokens_today, tokens_month = self.usage[user_id].get_current_token_usage()
-        images_today, images_month = self.usage[user_id].get_current_image_count()
-        (transcribe_minutes_today, transcribe_seconds_today, transcribe_minutes_month,
-         transcribe_seconds_month) = self.usage[user_id].get_current_transcription_duration()
-        vision_today, vision_month = self.usage[user_id].get_current_vision_tokens()
-        characters_today, characters_month = self.usage[user_id].get_current_tts_usage()
-        current_cost = self.usage[user_id].get_current_cost()
-
-        chat_id = update.effective_chat.id
-        chat_messages, chat_token_length = self.openai.get_conversation_stats(chat_id)
-        remaining_budget = get_remaining_budget(self.config, self.usage, update)
-        bot_language = self.config['bot_language']
-        
-        text_current_conversation = (
-            f"*{localized_text('stats_conversation', bot_language)[0]}*:\n"
-            f"{chat_messages} {localized_text('stats_conversation', bot_language)[1]}\n"
-            f"{chat_token_length} {localized_text('stats_conversation', bot_language)[2]}\n"
-            "----------------------------\n"
-        )
-        
-        # Check if image generation is enabled and, if so, generate the image statistics for today
-        text_today_images = ""
-        if self.config.get('enable_image_generation', False):
-            text_today_images = f"{images_today} {localized_text('stats_images', bot_language)}\n"
-
-        text_today_vision = ""
-        if self.config.get('enable_vision', False):
-            text_today_vision = f"{vision_today} {localized_text('stats_vision', bot_language)}\n"
-
-        text_today_tts = ""
-        if self.config.get('enable_tts_generation', False):
-            text_today_tts = f"{characters_today} {localized_text('stats_tts', bot_language)}\n"
-        
-        text_today = (
-            f"*{localized_text('usage_today', bot_language)}:*\n"
-            f"{tokens_today} {localized_text('stats_tokens', bot_language)}\n"
-            f"{text_today_images}"  # Include the image statistics for today if applicable
-            f"{text_today_vision}"
-            f"{text_today_tts}"
-            f"{transcribe_minutes_today} {localized_text('stats_transcribe', bot_language)[0]} "
-            f"{transcribe_seconds_today} {localized_text('stats_transcribe', bot_language)[1]}\n"
-            f"{localized_text('stats_total', bot_language)}{current_cost['cost_today']:.2f}\n"
-            "----------------------------\n"
-        )
-        
-        text_month_images = ""
-        if self.config.get('enable_image_generation', False):
-            text_month_images = f"{images_month} {localized_text('stats_images', bot_language)}\n"
-
-        text_month_vision = ""
-        if self.config.get('enable_vision', False):
-            text_month_vision = f"{vision_month} {localized_text('stats_vision', bot_language)}\n"
-
-        text_month_tts = ""
-        if self.config.get('enable_tts_generation', False):
-            text_month_tts = f"{characters_month} {localized_text('stats_tts', bot_language)}\n"
-        
-        # Check if image generation is enabled and, if so, generate the image statistics for the month
-        text_month = (
-            f"*{localized_text('usage_month', bot_language)}:*\n"
-            f"{tokens_month} {localized_text('stats_tokens', bot_language)}\n"
-            f"{text_month_images}"  # Include the image statistics for the month if applicable
-            f"{text_month_vision}"
-            f"{text_month_tts}"
-            f"{transcribe_minutes_month} {localized_text('stats_transcribe', bot_language)[0]} "
-            f"{transcribe_seconds_month} {localized_text('stats_transcribe', bot_language)[1]}\n"
-            f"{localized_text('stats_total', bot_language)}{current_cost['cost_month']:.2f}"
-        )
-
-        # text_budget filled with conditional content
-        text_budget = "\n\n"
-        budget_period = self.config['budget_period']
-        if remaining_budget < float('inf'):
-            text_budget += (
-                f"{localized_text('stats_budget', bot_language)}"
-                f"{localized_text(budget_period, bot_language)}: "
-                f"${remaining_budget:.2f}.\n"
-            )
-        # No longer works as of July 21st 2023, as OpenAI has removed the billing API
-        # add OpenAI account information for admin request
-        # if is_admin(self.config, user_id):
-        #     text_budget += (
-        #         f"{localized_text('stats_openai', bot_language)}"
-        #         f"{self.openai.get_billing_current_month():.2f}"
-        #     )
-
-        usage_text = text_current_conversation + text_today + text_month + text_budget
-        await update.message.reply_text(usage_text, parse_mode=constants.ParseMode.MARKDOWN)
-
-    async def resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Resend the last request
-        """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(f'User {update.message.from_user.name}  (id: {update.message.from_user.id})'
-                            ' is not allowed to resend the message')
-            await self.send_disallowed_message(update, context)
-            return
-
-        chat_id = update.effective_chat.id
-        if chat_id not in self.last_message:
-            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id})'
-                            ' does not have anything to resend')
+        if (
+            update.effective_chat is None
+            or update.effective_chat.type != constants.ChatType.PRIVATE
+        ):
             await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=localized_text('resend_failed', self.config['bot_language'])
+                "For safety, API keys can only be entered in a private chat with this bot."
+            )
+            return
+        if not context.args:
+            await update.effective_message.reply_text(
+                "Usage: /key sk-or-v1-...\nThe message will be deleted when Telegram permits it, "
+                "and the key will not be saved to disk."
             )
             return
 
-        # Update message text, clear self.last_message and send the request to prompt
-        logging.info(f'Resending the last prompt from user: {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})')
-        with update.message._unfrozen() as message:
-            message.text = self.last_message.pop(chat_id)
+        api_key = "".join(context.args).strip()
+        deleted = False
+        try:
+            await update.effective_message.delete()
+            deleted = True
+        except TelegramError:
+            logging.warning("Telegram would not delete an API-key message")
 
-        await self.prompt(update=update, context=context)
-
-    async def reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Resets the conversation.
-        """
-        if not await is_allowed(self.config, update, context):
-            logging.warning(f'User {update.message.from_user.name} (id: {update.message.from_user.id}) '
-                            'is not allowed to reset the conversation')
-            await self.send_disallowed_message(update, context)
+        try:
+            info = await self.openrouter.validate_api_key(api_key)
+        except OpenRouterError as exc:
+            warning = "" if deleted else " Delete your key message manually."
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"OpenRouter rejected that key: {exc}.{warning}",
+            )
             return
 
-        logging.info(f'Resetting the conversation for user {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})...')
-
-        chat_id = update.effective_chat.id
-        reset_content = message_text(update.message)
-        self.openai.reset_chat_history(chat_id=chat_id, content=reset_content)
-        await update.effective_message.reply_text(
-            message_thread_id=get_thread_id(update),
-            text=localized_text('reset_done', self.config['bot_language'])
+        user_id = self._user_id(update)
+        self.state.set_api_key(user_id, api_key)
+        label = info.get("label") or "validated key"
+        remaining = info.get("limit_remaining")
+        remaining_text = (
+            f" Remaining key limit: ${float(remaining):.4f}." if remaining is not None else ""
+        )
+        warning = (
+            "" if deleted else " Telegram could not delete the key message; delete it manually."
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                f"Authenticated with {label}.{remaining_text} The key is held only in memory."
+                f"{warning} Use /models next."
+            ),
         )
 
-    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Generates an image for the given prompt using DALL·E APIs
-        """
-        if not self.config['enable_image_generation'] \
-                or not await self.check_allowed_and_within_budget(update, context):
+    async def logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Forget the user's in-memory key and chat histories."""
+        if await self._preflight(update, context, require_key=False, enforce_budget=False) != "":
             return
+        user_id = self._user_id(update)
+        self.state.clear_api_key(user_id)
+        self.openrouter.reset_user_history(user_id)
+        await update.effective_message.reply_text("Your in-memory API key has been forgotten.")
 
-        image_query = message_text(update.message)
-        if image_query == '':
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=localized_text('image_no_prompt', self.config['bot_language'])
+    async def key_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show current OpenRouter API-key usage and limits."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
+            return
+        try:
+            info = await self.openrouter.get_key_info(api_key)
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+            return
+        lines = [
+            f"Key: {info.get('label') or 'OpenRouter key'}",
+            f"Usage: ${float(info.get('usage') or 0):.4f}",
+            f"Today: ${float(info.get('usage_daily') or 0):.4f}",
+            f"This week: ${float(info.get('usage_weekly') or 0):.4f}",
+            f"This month: ${float(info.get('usage_monthly') or 0):.4f}",
+        ]
+        if info.get("limit") is not None:
+            lines.append(
+                f"Key limit: ${float(info['limit']):.4f} ({info.get('limit_reset') or 'reset unknown'})"
+            )
+            lines.append(f"Remaining: ${float(info.get('limit_remaining') or 0):.4f}")
+        if info.get("expires_at"):
+            lines.append(f"Expires: {info['expires_at']}")
+        await self._reply_text(update, "\n".join(lines))
+
+    @staticmethod
+    def _parse_model_filter(arguments: list[str]) -> tuple[str | None, str]:
+        if arguments and arguments[0].lower() in {"text", "image", "file", "audio", "video"}:
+            return arguments[0].lower(), " ".join(arguments[1:]).strip()
+        return None, " ".join(arguments).strip()
+
+    async def models(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Browse the live OpenRouter text-output model catalog."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
+            return
+        input_modality, query = self._parse_model_filter(context.args)
+        try:
+            models = await self.openrouter.list_models(
+                api_key,
+                output_modality="text",
+                input_modality=input_modality,
+                query=query,
+            )
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+            return
+        self.catalog_views[(self._user_id(update), "text")] = CatalogView(
+            kind="text", models=models, query=query, input_modality=input_modality
+        )
+        await self._show_catalog_page(update, context, "text", 0)
+
+    async def image_models(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Browse the live OpenRouter image-output model catalog."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
+            return
+        query = " ".join(context.args).strip()
+        try:
+            models = await self.openrouter.list_models(
+                api_key, output_modality="image", query=query
+            )
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+            return
+        self.catalog_views[(self._user_id(update), "image")] = CatalogView(
+            kind="image", models=models, query=query
+        )
+        await self._show_catalog_page(update, context, "image", 0)
+
+    async def _show_catalog_page(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        kind: str,
+        page: int,
+        *,
+        edit: bool = False,
+    ) -> None:
+        user_id = self._user_id(update)
+        view = self.catalog_views.get((user_id, kind))
+        if view is None:
+            await self._reply_text(
+                update, "Run /models or /imagemodels again to refresh the catalog."
             )
             return
+        total_pages = max(1, math.ceil(len(view.models) / self.MODEL_PAGE_SIZE))
+        page = min(max(page, 0), total_pages - 1)
+        first = page * self.MODEL_PAGE_SIZE
+        visible = view.models[first : first + self.MODEL_PAGE_SIZE]
+        current = (
+            self.state.preferences_for(user_id).model
+            if kind == "text"
+            else self.state.preferences_for(user_id).image_model
+        )
+        filter_text = f" • input={view.input_modality}" if view.input_modality else ""
+        query_text = f" • search={view.query}" if view.query else ""
+        text = (
+            f"OpenRouter {'chat' if kind == 'text' else 'image'} models "
+            f"({len(view.models)} results{filter_text}{query_text})\n"
+            f"Page {page + 1}/{total_pages} • current: {current or 'not selected'}"
+        )
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, model in enumerate(visible, start=first):
+            label = f"✓ {model.name}" if model.id == current else model.name
+            rows.append(
+                [InlineKeyboardButton(label[:55], callback_data=f"modelpick:{kind[0]}:{index}")]
+            )
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton("‹ Previous", callback_data=f"modelpage:{kind[0]}:{page - 1}")
+            )
+        if page + 1 < total_pages:
+            navigation.append(
+                InlineKeyboardButton("Next ›", callback_data=f"modelpage:{kind[0]}:{page + 1}")
+            )
+        if navigation:
+            rows.append(navigation)
+        markup = InlineKeyboardMarkup(rows) if rows else None
+        if not visible:
+            text += "\nNo matching models. Try a broader search."
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+        else:
+            await update.effective_message.reply_text(text=text, reply_markup=markup)
 
-        logging.info(f'New image generation request received from user {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})')
-
-        async def _generate():
-            try:
-                image_url, image_size = await self.openai.generate_image(prompt=image_query)
-                if self.config['image_receive_mode'] == 'photo':
-                    await update.effective_message.reply_photo(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        photo=image_url
-                    )
-                elif self.config['image_receive_mode'] == 'document':
-                    await update.effective_message.reply_document(
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        document=image_url
-                    )
-                else:
-                    raise Exception(f"env variable IMAGE_RECEIVE_MODE has invalid value {self.config['image_receive_mode']}")
-                # add image request to users usage tracker
-                user_id = update.message.from_user.id
-                self.usage[user_id].add_image_request(image_size, self.config['image_prices'])
-                # add guest chat request to guest usage tracker
-                if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
-                    self.usage["guests"].add_image_request(image_size, self.config['image_prices'])
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('image_fail', self.config['bot_language'])}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_PHOTO)
-
-    async def tts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Generates an speech for the given input using TTS APIs
-        """
-        if not self.config['enable_tts_generation'] \
-                or not await self.check_allowed_and_within_budget(update, context):
+    async def model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle catalog paging and model selection buttons."""
+        query = update.callback_query
+        if query is None or query.data is None:
             return
-
-        tts_query = message_text(update.message)
-        if tts_query == '':
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=localized_text('tts_no_prompt', self.config['bot_language'])
+        await query.answer()
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            return
+        action, short_kind, raw_value = parts
+        kind = "text" if short_kind == "t" else "image"
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return
+        view = self.catalog_views.get((self._user_id(update), kind))
+        if view is None:
+            await query.edit_message_text(
+                "This catalog expired. Run /models or /imagemodels again."
             )
             return
-
-        logging.info(f'New speech generation request received from user {update.message.from_user.name} '
-                     f'(id: {update.message.from_user.id})')
-
-        async def _generate():
-            try:
-                speech_file, text_length = await self.openai.generate_speech(text=tts_query)
-
-                await update.effective_message.reply_voice(
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    voice=speech_file
-                )
-                speech_file.close()
-                # add image request to users usage tracker
-                user_id = update.message.from_user.id
-                self.usage[user_id].add_tts_request(text_length, self.config['tts_model'], self.config['tts_prices'])
-                # add guest chat request to guest usage tracker
-                if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
-                    self.usage["guests"].add_tts_request(text_length, self.config['tts_model'], self.config['tts_prices'])
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('tts_fail', self.config['bot_language'])}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-
-        await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_VOICE)
-
-    async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Transcribe audio messages.
-        """
-        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
+        if action == "modelpage":
+            await self._show_catalog_page(update, context, kind, value, edit=True)
             return
-
-        if is_group_chat(update) and self.config['ignore_group_transcriptions']:
-            logging.info('Transcription coming from group chat, ignoring...')
+        if action != "modelpick" or value < 0 or value >= len(view.models):
             return
+        model = view.models[value]
+        if kind == "text":
+            self.state.set_model(self._user_id(update), model.id)
+            self.openrouter.reset_user_history(self._user_id(update))
+        else:
+            self.state.set_image_model(self._user_id(update), model.id)
+        await query.edit_message_text(
+            f"Selected {model.name}\n{model.id}\n{model.price_summary()}\n"
+            f"Input: {', '.join(sorted(model.input_modalities))} • "
+            f"Output: {', '.join(sorted(model.output_modalities))}"
+        )
 
-        chat_id = update.effective_chat.id
-        filename = update.message.effective_attachment.file_unique_id
-
-        async def _execute():
-            filename_mp3 = f'{filename}.mp3'
-            bot_language = self.config['bot_language']
-            try:
-                media_file = await context.bot.get_file(update.message.effective_attachment.file_id)
-                await media_file.download_to_drive(filename)
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=(
-                        f"{localized_text('media_download_fail', bot_language)[0]}: "
-                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
-                    ),
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-                return
-
-            try:
-                audio_track = AudioSegment.from_file(filename)
-                audio_track.export(filename_mp3, format="mp3")
-                logging.info(f'New transcribe request received from user {update.message.from_user.name} '
-                             f'(id: {update.message.from_user.id})')
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=localized_text('media_type_fail', bot_language)
-                )
-                if os.path.exists(filename):
-                    os.remove(filename)
-                return
-
-            user_id = update.message.from_user.id
-            if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
-
-            try:
-                transcript = await self.openai.transcribe(filename_mp3)
-
-                transcription_price = self.config['transcription_price']
-                self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-                allowed_user_ids = self.config['allowed_user_ids'].split(',')
-                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                    self.usage["guests"].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-                # check if transcript starts with any of the prefixes
-                response_to_transcription = any(transcript.lower().startswith(prefix.lower()) if prefix else False
-                                                for prefix in self.config['voice_reply_prompts'])
-
-                if self.config['voice_reply_transcript'] and not response_to_transcription:
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\""
-                    chunks = split_into_chunks(transcript_output)
-
-                    for index, transcript_chunk in enumerate(chunks):
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                            text=transcript_chunk,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-                else:
-                    # Get the response of the transcript
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=transcript)
-
-                    self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
-                    if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                        self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    transcript_output = (
-                        f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\"\n\n"
-                        f"_{localized_text('answer', bot_language)}:_\n{response}"
-                    )
-                    chunks = split_into_chunks(transcript_output)
-
-                    for index, transcript_chunk in enumerate(chunks):
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                            text=transcript_chunk,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=f"{localized_text('transcribe_fail', bot_language)}: {str(e)}",
-                    parse_mode=constants.ParseMode.MARKDOWN
-                )
-            finally:
-                if os.path.exists(filename_mp3):
-                    os.remove(filename_mp3)
-                if os.path.exists(filename):
-                    os.remove(filename)
-
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
-
-    async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Interpret image using vision model.
-        """
-        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
+    async def model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show or select an exact OpenRouter chat-model slug."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
             return
+        preferences = self.state.preferences_for(self._user_id(update))
+        if not context.args:
+            await self._reply_text(
+                update,
+                f"Current chat model: {preferences.model}\n"
+                "Select with /model provider/model or browse with /models.",
+            )
+            return
+        model_id = context.args[0].strip()
+        try:
+            model = await self.openrouter.get_model(api_key, model_id)
+            if "text" not in model.output_modalities:
+                raise OpenRouterError("That model does not produce text; use /imagemodel instead.")
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+            return
+        self.state.set_model(self._user_id(update), model.id)
+        self.openrouter.reset_user_history(self._user_id(update))
+        await self._reply_text(
+            update,
+            f"Selected {model.name}\n{model.id}\n{model.price_summary()}\n"
+            f"Inputs: {', '.join(sorted(model.input_modalities))}",
+        )
 
-        chat_id = update.effective_chat.id
-        prompt = update.message.caption
+    async def image_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show or select an exact OpenRouter image-model slug."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
+            return
+        preferences = self.state.preferences_for(self._user_id(update))
+        if not context.args:
+            await self._reply_text(
+                update,
+                f"Current image model: {preferences.image_model or 'not selected'}\n"
+                "Select with /imagemodel provider/model or browse with /imagemodels.",
+            )
+            return
+        model_id = context.args[0].strip()
+        try:
+            model = await self.openrouter.get_model(api_key, model_id)
+            if "image" not in model.output_modalities:
+                raise OpenRouterError("That model does not generate images; use /model instead.")
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+            return
+        self.state.set_image_model(self._user_id(update), model.id)
+        await self._reply_text(
+            update,
+            f"Selected image model {model.name}\n{model.id}\nInputs: "
+            f"{', '.join(sorted(model.input_modalities))}",
+        )
 
-        if is_group_chat(update):
-            if self.config['ignore_group_vision']:
-                logging.info('Vision coming from group chat, ignoring...')
-                return
+    async def budget(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show, set, or disable the user's local soft budget."""
+        if await self._preflight(update, context, require_key=False, enforce_budget=False) != "":
+            return
+        user_id = self._user_id(update)
+        preferences = self.state.preferences_for(user_id)
+        tracker = self._tracker(update)
+        if not context.args:
+            if preferences.budget_limit is None:
+                personal = "Local budget: off"
             else:
-                trigger_keyword = self.config['group_trigger_keyword']
-                if (prompt is None and trigger_keyword != '') or \
-                   (prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())):
-                    logging.info('Vision coming from group chat with wrong keyword, ignoring...')
-                    return
-        
-        image = update.message.effective_attachment[-1]
-        
+                spent = tracker.get_cost_for_period(preferences.budget_period)
+                personal = (
+                    f"Local budget: ${preferences.budget_limit:.2f} {preferences.budget_period}\n"
+                    f"Tracked spend: ${spent:.6f}\nRemaining before next request: "
+                    f"${max(0.0, preferences.budget_limit - spent):.6f}"
+                )
+            server_remaining, _ = self._remaining_budgets(update)
+            server = (
+                "Deployment budget: unlimited"
+                if math.isinf(server_remaining)
+                else f"Deployment budget remaining: ${max(0.0, server_remaining):.6f}"
+            )
+            await self._reply_text(
+                update,
+                f"{personal}\n{server}\n\nSet: /budget 5 monthly\nDisable: /budget off\n"
+                "Periods: daily, weekly, monthly, all-time. This is a pre-request soft cap, so "
+                "one request can exceed it; use an OpenRouter key limit for a hard cap.",
+            )
+            return
+        if context.args[0].lower() == "off":
+            self.state.clear_budget(user_id)
+            await self._reply_text(update, "Your local soft budget is disabled.")
+            return
+        try:
+            limit = float(context.args[0].removeprefix("$"))
+            period = context.args[1].lower() if len(context.args) > 1 else "monthly"
+            if period not in VALID_BUDGET_PERIODS:
+                raise ValueError("invalid period")
+            self.state.set_budget(user_id, limit, period)
+        except (ValueError, IndexError):
+            await self._reply_text(
+                update,
+                "Usage: /budget AMOUNT [daily|weekly|monthly|all-time], for example "
+                "/budget 5 monthly, or /budget off.",
+            )
+            return
+        await self._reply_text(update, f"Local soft budget set to ${limit:.2f} {period}.")
 
-        async def _execute():
-            bot_language = self.config['bot_language']
-            try:
-                media_file = await context.bot.get_file(image.file_id)
-                temp_file = io.BytesIO(await media_file.download_as_bytearray())
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show local exact costs, current model, and remote key limits."""
+        api_key = await self._preflight(update, context, enforce_budget=False)
+        if api_key is None:
+            return
+        tracker = self._tracker(update)
+        tokens_today, tokens_month = tracker.get_current_token_usage()
+        current_cost = tracker.get_current_cost()
+        preferences = self.state.preferences_for(self._user_id(update))
+        message_count, history_size = self.openrouter.get_conversation_stats(
+            self._user_id(update), self._session_id(update)
+        )
+        lines = [
+            f"Chat model: {preferences.model}",
+            f"Image model: {preferences.image_model or 'not selected'}",
+            f"Conversation: {message_count} messages, ~{history_size:,} serialized characters",
+            "",
+            f"Today: {tokens_today:,} tokens • ${current_cost['cost_today']:.6f}",
+            f"This month: {tokens_month:,} tokens • ${current_cost['cost_month']:.6f}",
+            f"All time: ${current_cost['cost_all_time']:.6f}",
+        ]
+        model_usage = tracker.get_model_usage()
+        if model_usage:
+            lines.append("\nToday's models:")
+            for model, values in sorted(
+                model_usage.items(), key=lambda item: item[1].get("cost", 0), reverse=True
+            )[:5]:
+                lines.append(
+                    f"• {model}: {values.get('requests', 0)} requests, "
+                    f"{values.get('tokens', 0):,} tokens, ${values.get('cost', 0):.6f}"
+                )
+        try:
+            key_info = await self.openrouter.get_key_info(api_key)
+            lines.append(f"\nOpenRouter key usage: ${float(key_info.get('usage') or 0):.4f}")
+            if key_info.get("limit_remaining") is not None:
+                lines.append(
+                    f"OpenRouter key limit remaining: ${float(key_info['limit_remaining']):.4f}"
+                )
+        except OpenRouterError as exc:
+            lines.append(f"\nCould not refresh key totals: {exc}")
+        await self._reply_text(update, "\n".join(lines))
+
+    async def reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Reset the current user/chat/thread conversation."""
+        if await self._preflight(update, context, enforce_budget=False) is None:
+            return
+        self.openrouter.reset_chat_history(self._user_id(update), self._session_id(update))
+        await self._reply_text(update, "Conversation reset.")
+
+    async def resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Repeat the user's last text prompt in this conversation."""
+        session_key = (self._user_id(update), self._session_id(update))
+        prompt = self.last_message.get(session_key)
+        if not prompt:
+            await self._reply_text(update, "There is no previous text prompt to resend.")
+            return
+        await self._infer(update, context, prompt)
+
+    async def image(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Generate an image through OpenRouter's dedicated Image API."""
+        if not self.config["enable_image_generation"]:
+            return
+        api_key = await self._preflight(update, context)
+        if api_key is None:
+            return
+        prompt = message_text(update.effective_message)
+        if not prompt:
+            await self._reply_text(update, "Usage: /image describe the image to create")
+            return
+        model_id = self.state.preferences_for(self._user_id(update)).image_model
+        if not model_id:
+            await self._reply_text(update, "Choose an image model first with /imagemodels.")
+            return
+        await update.effective_chat.send_action(
+            constants.ChatAction.UPLOAD_PHOTO, message_thread_id=get_thread_id(update)
+        )
+        try:
+            result = await self.openrouter.generate_image(api_key, model_id, prompt)
+            await self._send_generated_images(update, result)
+            self._record_usage(update, result.usage, result.model)
+        except OpenRouterError as exc:
+            await self._reply_text(update, str(exc))
+
+    async def _send_generated_images(self, update: Update, result: ImageGenerationResult) -> None:
+        for index, image in enumerate(result.images):
+            suffix = {
+                "image/jpeg": "jpg",
+                "image/webp": "webp",
+                "image/svg+xml": "svg",
+            }.get(image.media_type, "png")
+            file_object = io.BytesIO(image.data)
+            file_object.name = f"openrouter-image-{index + 1}.{suffix}"
+            if image.media_type == "image/svg+xml":
+                await update.effective_message.reply_document(
+                    document=file_object,
                     message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=(
-                        f"{localized_text('media_download_fail', bot_language)[0]}: "
-                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
+                    reply_to_message_id=(
+                        get_reply_to_message_id(self.config, update) if index == 0 else None
                     ),
-                    parse_mode=constants.ParseMode.MARKDOWN
                 )
-                return
-            
-            # convert jpg from telegram to png as understood by openai
-
-            temp_file_png = io.BytesIO()
-
-            try:
-                original_image = Image.open(temp_file)
-                
-                original_image.save(temp_file_png, format='PNG')
-                logging.info(f'New vision request received from user {update.message.from_user.name} '
-                             f'(id: {update.message.from_user.id})')
-
-            except Exception as e:
-                logging.exception(e)
-                await update.effective_message.reply_text(
-                    message_thread_id=get_thread_id(update),
-                    reply_to_message_id=get_reply_to_message_id(self.config, update),
-                    text=localized_text('media_type_fail', bot_language)
-                )
-            
-            
-
-            user_id = update.message.from_user.id
-            if user_id not in self.usage:
-                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
-
-            if self.config['stream']:
-
-                stream_response = self.openai.interpret_image_stream(chat_id=chat_id, fileobj=temp_file_png, prompt=prompt)
-                i = 0
-                prev = ''
-                sent_message = None
-                backoff = 0
-                stream_chunk = 0
-
-                async for content, tokens in stream_response:
-                    if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content)
-
-                    if len(content.strip()) == 0:
-                        continue
-
-                    stream_chunks = split_into_chunks(content)
-                    if len(stream_chunks) > 1:
-                        content = stream_chunks[-1]
-                        if stream_chunk != len(stream_chunks) - 1:
-                            stream_chunk += 1
-                            try:
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              stream_chunks[-2])
-                            except:
-                                pass
-                            try:
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    text=content if len(content) > 0 else "..."
-                                )
-                            except:
-                                pass
-                            continue
-
-                    cutoff = get_stream_cutoff_values(update, content)
-                    cutoff += backoff
-
-                    if i == 0:
-                        try:
-                            if sent_message is not None:
-                                await context.bot.delete_message(chat_id=sent_message.chat_id,
-                                                                 message_id=sent_message.message_id)
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
-                            )
-                        except:
-                            continue
-
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
-
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown)
-
-                        except RetryAfter as e:
-                            backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
-                            continue
-
-                        except Exception:
-                            backoff += 5
-                            continue
-
-                        await asyncio.sleep(0.01)
-
-                    i += 1
-                    if tokens != 'not_finished':
-                        total_tokens = int(tokens)
-
-                
             else:
+                await update.effective_message.reply_photo(
+                    photo=file_object,
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=(
+                        get_reply_to_message_id(self.config, update) if index == 0 else None
+                    ),
+                )
+        if self.config["show_usage"]:
+            await self._reply_text(update, self._usage_footer(result.usage, result.model).lstrip())
 
-                try:
-                    interpretation, total_tokens = await self.openai.interpret_image(chat_id, temp_file_png, prompt=prompt)
-
-
-                    try:
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update),
-                            text=interpretation,
-                            parse_mode=constants.ParseMode.MARKDOWN
-                        )
-                    except BadRequest:
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=interpretation
-                            )
-                        except Exception as e:
-                            logging.exception(e)
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                except Exception as e:
-                    logging.exception(e)
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-            vision_token_price = self.config['vision_token_price']
-            self.usage[user_id].add_vision_tokens(total_tokens, vision_token_price)
-
-            allowed_user_ids = self.config['allowed_user_ids'].split(',')
-            if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                self.usage["guests"].add_vision_tokens(total_tokens, vision_token_price)
-
-        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
-
-    async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        React to incoming messages and respond accordingly.
-        """
+    async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a Telegram text message to the selected OpenRouter model."""
         if update.edited_message or not update.message or update.message.via_bot:
             return
-
-        if not await self.check_allowed_and_within_budget(update, context):
-            return
-
-        logging.info(
-            f'New message received from user {update.message.from_user.name} (id: {update.message.from_user.id})')
-        chat_id = update.effective_chat.id
-        user_id = update.message.from_user.id
         prompt = message_text(update.message)
-        self.last_message[chat_id] = prompt
-
         if is_group_chat(update):
-            trigger_keyword = self.config['group_trigger_keyword']
+            trigger = str(self.config["group_trigger_keyword"])
+            is_chat_command = bool(
+                update.message.text and update.message.text.lower().startswith("/chat")
+            )
+            if trigger and prompt.lower().startswith(trigger.lower()):
+                prompt = prompt[len(trigger) :].strip()
+            elif not is_chat_command and not (
+                update.message.reply_to_message
+                and update.message.reply_to_message.from_user
+                and update.message.reply_to_message.from_user.id == context.bot.id
+            ):
+                return
+            if update.message.reply_to_message and update.message.reply_to_message.text:
+                prompt = f"Quoted message:\n{update.message.reply_to_message.text}\n\n{prompt}"
+        if not prompt:
+            await self._reply_text(update, "Send some text after /chat.")
+            return
+        self.last_message[(self._user_id(update), self._session_id(update))] = prompt
+        await self._infer(update, context, prompt)
 
-            if prompt.lower().startswith(trigger_keyword.lower()) or update.message.text.lower().startswith('/chat'):
-                if prompt.lower().startswith(trigger_keyword.lower()):
-                    prompt = prompt[len(trigger_keyword):].strip()
-
-                if update.message.reply_to_message and \
-                        update.message.reply_to_message.text and \
-                        update.message.reply_to_message.from_user.id != context.bot.id:
-                    prompt = f'"{update.message.reply_to_message.text}" {prompt}'
-            else:
-                if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
-                    logging.info('Message is a reply to the bot, allowing...')
-                else:
-                    logging.warning('Message does not start with trigger keyword, ignoring...')
-                    return
-
+    async def photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send a Telegram photo/image document to a vision-capable model."""
+        if is_group_chat(update) and self.config["ignore_group_attachments"]:
+            return
+        api_key = await self._preflight(update, context)
+        if api_key is None:
+            return
+        attachment = update.effective_message.effective_attachment
+        telegram_file = attachment[-1] if isinstance(attachment, tuple | list) else attachment
+        if telegram_file is None:
+            return
+        mime_type = "image/jpeg"
+        if update.effective_message.document and update.effective_message.document.mime_type:
+            mime_type = update.effective_message.document.mime_type
         try:
-            total_tokens = 0
-
-            if self.config['stream']:
-                await update.effective_message.reply_chat_action(
-                    action=constants.ChatAction.TYPING,
-                    message_thread_id=get_thread_id(update)
+            model_id = self.state.preferences_for(self._user_id(update)).model
+            model = await self.openrouter.get_model(api_key, model_id)
+            if "image" not in model.input_modalities:
+                raise OpenRouterError(
+                    f"{model_id} does not accept images. Use /models image to choose a vision model."
                 )
+            media = await context.bot.get_file(telegram_file.file_id)
+            data = bytes(await media.download_as_bytearray())
+            self._check_file_size(data)
+            prompt = update.effective_message.caption or "Describe and analyze this image."
+            content = image_content(data, mime_type, prompt)
+            await self._infer(update, context, content, api_key=api_key)
+        except (OpenRouterError, ValueError) as exc:
+            await self._reply_text(update, str(exc))
 
-                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
-                i = 0
-                prev = ''
-                sent_message = None
-                backoff = 0
-                stream_chunk = 0
-
-                async for content, tokens in stream_response:
-                    if is_direct_result(content):
-                        return await handle_direct_result(self.config, update, content)
-
-                    if len(content.strip()) == 0:
-                        continue
-
-                    stream_chunks = split_into_chunks(content)
-                    if len(stream_chunks) > 1:
-                        content = stream_chunks[-1]
-                        if stream_chunk != len(stream_chunks) - 1:
-                            stream_chunk += 1
-                            try:
-                                await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                              stream_chunks[-2])
-                            except:
-                                pass
-                            try:
-                                sent_message = await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    text=content if len(content) > 0 else "..."
-                                )
-                            except:
-                                pass
-                            continue
-
-                    cutoff = get_stream_cutoff_values(update, content)
-                    cutoff += backoff
-
-                    if i == 0:
-                        try:
-                            if sent_message is not None:
-                                await context.bot.delete_message(chat_id=sent_message.chat_id,
-                                                                 message_id=sent_message.message_id)
-                            sent_message = await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                                text=content,
-                            )
-                        except:
-                            continue
-
-                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                        prev = content
-
-                        try:
-                            use_markdown = tokens != 'not_finished'
-                            await edit_message_with_retry(context, chat_id, str(sent_message.message_id),
-                                                          text=content, markdown=use_markdown)
-
-                        except RetryAfter as e:
-                            backoff += 5
-                            await asyncio.sleep(e.retry_after)
-                            continue
-
-                        except TimedOut:
-                            backoff += 5
-                            await asyncio.sleep(0.5)
-                            continue
-
-                        except Exception:
-                            backoff += 5
-                            continue
-
-                        await asyncio.sleep(0.01)
-
-                    i += 1
-                    if tokens != 'not_finished':
-                        total_tokens = int(tokens)
-
-            else:
-                async def _reply():
-                    nonlocal total_tokens
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
-
-                    if is_direct_result(response):
-                        return await handle_direct_result(self.config, update, response)
-
-                    # Split into chunks of 4096 characters (Telegram's message limit)
-                    chunks = split_into_chunks(response)
-
-                    for index, chunk in enumerate(chunks):
-                        try:
-                            await update.effective_message.reply_text(
-                                message_thread_id=get_thread_id(update),
-                                reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                            update) if index == 0 else None,
-                                text=chunk,
-                                parse_mode=constants.ParseMode.MARKDOWN
-                            )
-                        except Exception:
-                            try:
-                                await update.effective_message.reply_text(
-                                    message_thread_id=get_thread_id(update),
-                                    reply_to_message_id=get_reply_to_message_id(self.config,
-                                                                                update) if index == 0 else None,
-                                    text=chunk
-                                )
-                            except Exception as exception:
-                                raise exception
-
-                await wrap_with_indicator(update, context, _reply, constants.ChatAction.TYPING)
-
-            add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
-
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
-                parse_mode=constants.ParseMode.MARKDOWN
+    def _check_file_size(self, data: bytes) -> None:
+        maximum = int(self.config["max_file_size_mb"]) * 1024 * 1024
+        if len(data) > maximum:
+            raise ValueError(
+                f"This file is {len(data) / 1024 / 1024:.1f} MB; the configured limit is "
+                f"{self.config['max_file_size_mb']} MB."
             )
 
-    async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """
-        Handle the inline query. This is run when you type: @botusername <query>
-        """
-        query = update.inline_query.query
-        if len(query) < 3:
+    @staticmethod
+    def _is_text_document(filename: str, mime_type: str) -> bool:
+        extension = Path(filename.lower()).suffix
+        return (
+            mime_type.startswith("text/")
+            or mime_type in TEXT_MIME_TYPES
+            or extension in TEXT_EXTENSIONS
+        )
+
+    async def document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send PDFs, text/code, and native model-supported files to OpenRouter."""
+        if is_group_chat(update) and self.config["ignore_group_attachments"]:
             return
-        if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
+        api_key = await self._preflight(update, context)
+        if api_key is None or update.effective_message.document is None:
             return
-
-        callback_data_suffix = "gpt:"
-        result_id = str(uuid4())
-        self.inline_queries_cache[result_id] = query
-        callback_data = f'{callback_data_suffix}{result_id}'
-
-        await self.send_inline_query_result(update, result_id, message_content=query, callback_data=callback_data)
-
-    async def send_inline_query_result(self, update: Update, result_id, message_content, callback_data=""):
-        """
-        Send inline query result
-        """
+        document = update.effective_message.document
+        filename = document.file_name or "telegram-upload"
+        mime_type = (
+            document.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        )
         try:
-            reply_markup = None
-            bot_language = self.config['bot_language']
-            if callback_data:
-                reply_markup = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(text=f'🤖 {localized_text("answer_with_chatgpt", bot_language)}',
-                                         callback_data=callback_data)
-                ]])
-
-            inline_query_result = InlineQueryResultArticle(
-                id=result_id,
-                title=localized_text("ask_chatgpt", bot_language),
-                input_message_content=InputTextMessageContent(message_content),
-                description=message_content,
-                thumbnail_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png',
-                reply_markup=reply_markup
-            )
-
-            await update.inline_query.answer([inline_query_result], cache_time=0)
-        except Exception as e:
-            logging.error(f'An error occurred while generating the result card for inline query {e}')
-
-    async def handle_callback_inline_query(self, update: Update, context: CallbackContext):
-        """
-        Handle the callback query from the inline query result
-        """
-        callback_data = update.callback_query.data
-        user_id = update.callback_query.from_user.id
-        inline_message_id = update.callback_query.inline_message_id
-        name = update.callback_query.from_user.name
-        callback_data_suffix = "gpt:"
-        query = ""
-        bot_language = self.config['bot_language']
-        answer_tr = localized_text("answer", bot_language)
-        loading_tr = localized_text("loading", bot_language)
-
-        try:
-            if callback_data.startswith(callback_data_suffix):
-                unique_id = callback_data.split(':')[1]
-                total_tokens = 0
-
-                # Retrieve the prompt from the cache
-                query = self.inline_queries_cache.get(unique_id)
-                if query:
-                    self.inline_queries_cache.pop(unique_id)
-                else:
-                    error_message = (
-                        f'{localized_text("error", bot_language)}. '
-                        f'{localized_text("try_again", bot_language)}'
+            media = await context.bot.get_file(document.file_id)
+            data = bytes(await media.download_as_bytearray())
+            self._check_file_size(data)
+            prompt = update.effective_message.caption or f"Analyze the attached file {filename}."
+            if self._is_text_document(filename, mime_type):
+                decoded = data.decode("utf-8-sig")
+                max_chars = int(self.config["text_file_max_chars"])
+                if len(decoded) > max_chars:
+                    raise ValueError(
+                        f"Decoded text has {len(decoded):,} characters; the configured limit is "
+                        f"{max_chars:,}."
                     )
-                    await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                  text=f'{query}\n\n_{answer_tr}:_\n{error_message}',
-                                                  is_inline=True)
-                    return
-
-                unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
-                if self.config['stream']:
-                    stream_response = self.openai.get_chat_response_stream(chat_id=user_id, query=query)
-                    i = 0
-                    prev = ''
-                    backoff = 0
-                    async for content, tokens in stream_response:
-                        if is_direct_result(content):
-                            cleanup_intermediate_files(content)
-                            await edit_message_with_retry(context, chat_id=None,
-                                                          message_id=inline_message_id,
-                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
-                                                          is_inline=True)
-                            return
-
-                        if len(content.strip()) == 0:
-                            continue
-
-                        cutoff = get_stream_cutoff_values(update, content)
-                        cutoff += backoff
-
-                        if i == 0:
-                            try:
-                                await edit_message_with_retry(context, chat_id=None,
-                                                              message_id=inline_message_id,
-                                                              text=f'{query}\n\n{answer_tr}:\n{content}',
-                                                              is_inline=True)
-                            except:
-                                continue
-
-                        elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
-                            prev = content
-                            try:
-                                use_markdown = tokens != 'not_finished'
-                                divider = '_' if use_markdown else ''
-                                text = f'{query}\n\n{divider}{answer_tr}:{divider}\n{content}'
-
-                                # We only want to send the first 4096 characters. No chunking allowed in inline mode.
-                                text = text[:4096]
-
-                                await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                              text=text, markdown=use_markdown, is_inline=True)
-
-                            except RetryAfter as e:
-                                backoff += 5
-                                await asyncio.sleep(e.retry_after)
-                                continue
-                            except TimedOut:
-                                backoff += 5
-                                await asyncio.sleep(0.5)
-                                continue
-                            except Exception:
-                                backoff += 5
-                                continue
-
-                            await asyncio.sleep(0.01)
-
-                        i += 1
-                        if tokens != 'not_finished':
-                            total_tokens = int(tokens)
-
-                else:
-                    async def _send_inline_query_response():
-                        nonlocal total_tokens
-                        # Edit the current message to indicate that the answer is being processed
-                        await context.bot.edit_message_text(inline_message_id=inline_message_id,
-                                                            text=f'{query}\n\n_{answer_tr}:_\n{loading_tr}',
-                                                            parse_mode=constants.ParseMode.MARKDOWN)
-
-                        logging.info(f'Generating response for inline query by {name}')
-                        response, total_tokens = await self.openai.get_chat_response(chat_id=user_id, query=query)
-
-                        if is_direct_result(response):
-                            cleanup_intermediate_files(response)
-                            await edit_message_with_retry(context, chat_id=None,
-                                                          message_id=inline_message_id,
-                                                          text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
-                                                          is_inline=True)
-                            return
-
-                        text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
-
-                        # We only want to send the first 4096 characters. No chunking allowed in inline mode.
-                        text_content = text_content[:4096]
-
-                        # Edit the original message with the generated content
-                        await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                                      text=text_content, is_inline=True)
-
-                    await wrap_with_indicator(update, context, _send_inline_query_response,
-                                              constants.ChatAction.TYPING, is_inline=True)
-
-                add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
-
-        except Exception as e:
-            logging.error(f'Failed to respond to an inline query via button callback: {e}')
-            logging.exception(e)
-            localized_answer = localized_text('chat_fail', self.config['bot_language'])
-            await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
-                                          text=f"{query}\n\n_{answer_tr}:_\n{localized_answer} {str(e)}",
-                                          is_inline=True)
-
-    async def check_allowed_and_within_budget(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                              is_inline=False) -> bool:
-        """
-        Checks if the user is allowed to use the bot and if they are within their budget
-        :param update: Telegram update object
-        :param context: Telegram context object
-        :param is_inline: Boolean flag for inline queries
-        :return: Boolean indicating if the user is allowed to use the bot
-        """
-        name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
-        user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
-
-        if not await is_allowed(self.config, update, context, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) is not allowed to use the bot')
-            await self.send_disallowed_message(update, context, is_inline)
-            return False
-        if not is_within_budget(self.config, self.usage, update, is_inline=is_inline):
-            logging.warning(f'User {name} (id: {user_id}) reached their usage limit')
-            await self.send_budget_reached_message(update, context, is_inline)
-            return False
-
-        return True
-
-    async def send_disallowed_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
-        """
-        Sends the disallowed message to the user.
-        """
-        if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=self.disallowed_message,
-                disable_web_page_preview=True
+                content: str | list[dict[str, Any]] = (
+                    f"{prompt}\n\n--- BEGIN FILE: {filename} ---\n{decoded}\n"
+                    f"--- END FILE: {filename} ---"
+                )
+            else:
+                model_id = self.state.preferences_for(self._user_id(update)).model
+                model = await self.openrouter.get_model(api_key, model_id)
+                if mime_type != "application/pdf" and "file" not in model.input_modalities:
+                    raise OpenRouterError(
+                        f"{model_id} does not advertise native file input for {mime_type}. "
+                        "Use /models file, or upload PDF/text/code instead."
+                    )
+                content = file_content(data, filename, mime_type, prompt)
+            await self._infer(update, context, content, api_key=api_key)
+        except UnicodeDecodeError:
+            await self._reply_text(
+                update,
+                "That file looks textual but is not valid UTF-8. Convert it to UTF-8 or choose a "
+                "model with native file support using /models file.",
             )
-        else:
-            result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.disallowed_message)
+        except (OpenRouterError, ValueError) as exc:
+            await self._reply_text(update, str(exc))
 
-    async def send_budget_reached_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
-        """
-        Sends the budget reached message to the user.
-        """
-        if not is_inline:
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                text=self.budget_limit_message
+    async def _infer(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        content: str | list[dict[str, Any]],
+        *,
+        api_key: str | None = None,
+    ) -> None:
+        if api_key is None:
+            api_key = await self._preflight(update, context)
+            if api_key is None:
+                return
+        model_id = self.state.preferences_for(self._user_id(update)).model
+        await update.effective_chat.send_action(
+            constants.ChatAction.TYPING, message_thread_id=get_thread_id(update)
+        )
+        try:
+            contains_file = isinstance(content, list) and any(
+                part.get("type") == "file" for part in content
             )
+            if self.config["stream"] and not contains_file:
+                final = await self._stream_response(update, api_key, model_id, content)
+                self._record_usage(update, final.usage, final.model or model_id)
+            else:
+                result = await self.openrouter.chat(
+                    api_key,
+                    self._user_id(update),
+                    self._session_id(update),
+                    model_id,
+                    content,
+                )
+                await self._reply_text(
+                    update, result.text + self._usage_footer(result.usage, result.model or model_id)
+                )
+                self._record_usage(update, result.usage, result.model or model_id)
+        except OpenRouterError as exc:
+            logging.warning(
+                "OpenRouter request failed for Telegram user %s: %s", self._user_id(update), exc
+            )
+            await self._reply_text(update, str(exc))
+
+    async def _stream_response(
+        self,
+        update: Update,
+        api_key: str,
+        model_id: str,
+        content: str | list[dict[str, Any]],
+    ) -> StreamUpdate:
+        sent_message = None
+        last_edit = ""
+        final_update = StreamUpdate(text="", done=True, model=model_id)
+        async for stream_update in self.openrouter.chat_stream(
+            api_key,
+            self._user_id(update),
+            self._session_id(update),
+            model_id,
+            content,
+        ):
+            if stream_update.done:
+                final_update = stream_update
+                break
+            visible = stream_update.text[:4096]
+            if not visible:
+                continue
+            if sent_message is None:
+                sent_message = await update.effective_message.reply_text(
+                    visible,
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                )
+                last_edit = visible
+            elif len(visible) - len(last_edit) >= 80:
+                try:
+                    await sent_message.edit_text(visible)
+                    last_edit = visible
+                except RetryAfter as exc:
+                    await asyncio.sleep(exc.retry_after)
+                except (TimedOut, BadRequest):
+                    pass
+
+        final_text = final_update.text + self._usage_footer(
+            final_update.usage, final_update.model or model_id
+        )
+        chunks = split_into_chunks(final_text or "(empty response)")
+        if sent_message is None:
+            await self._reply_text(update, final_text)
         else:
-            result_id = str(uuid4())
-            await self.send_inline_query_result(update, result_id, message_content=self.budget_limit_message)
+            with contextlib.suppress(BadRequest):
+                await sent_message.edit_text(chunks[0], disable_web_page_preview=True)
+            for chunk in chunks[1:]:
+                await update.effective_message.reply_text(
+                    chunk,
+                    message_thread_id=get_thread_id(update),
+                    disable_web_page_preview=True,
+                )
+        return final_update
 
     async def post_init(self, application: Application) -> None:
-        """
-        Post initialization hook for the bot.
-        """
-        await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
+        """Register Telegram command menus."""
+        await application.bot.set_my_commands(
+            self.group_commands, scope=BotCommandScopeAllGroupChats()
+        )
         await application.bot.set_my_commands(self.commands)
 
-    def run(self):
-        """
-        Runs the bot indefinitely until the user presses Ctrl+C
-        """
-        application = ApplicationBuilder() \
-            .token(self.config['token']) \
-            .proxy_url(self.config['proxy']) \
-            .get_updates_proxy_url(self.config['proxy']) \
-            .post_init(self.post_init) \
-            .concurrent_updates(True) \
-            .build()
+    async def post_shutdown(self, _: Application) -> None:
+        """Release OpenRouter HTTP connections during shutdown."""
+        await self.openrouter.close()
 
-        application.add_handler(CommandHandler('reset', self.reset))
-        application.add_handler(CommandHandler('help', self.help))
-        application.add_handler(CommandHandler('image', self.image))
-        application.add_handler(CommandHandler('tts', self.tts))
-        application.add_handler(CommandHandler('start', self.help))
-        application.add_handler(CommandHandler('stats', self.stats))
-        application.add_handler(CommandHandler('resend', self.resend))
-        application.add_handler(CommandHandler(
-            'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+    async def error_handler(self, _: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Log unexpected Telegram update failures without exposing secrets."""
+        logging.error("Exception while handling Telegram update", exc_info=context.error)
+
+    def build_application(self) -> Application:
+        """Build the Telegram application and register all handlers."""
+        builder = (
+            ApplicationBuilder()
+            .token(self.config["token"])
+            .post_init(self.post_init)
+            .post_shutdown(self.post_shutdown)
+            .concurrent_updates(True)
         )
-        application.add_handler(MessageHandler(
-            filters.PHOTO | filters.Document.IMAGE,
-            self.vision))
-        application.add_handler(MessageHandler(
-            filters.AUDIO | filters.VOICE | filters.Document.AUDIO |
-            filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO,
-            self.transcribe))
-        application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.prompt))
-        application.add_handler(InlineQueryHandler(self.inline_query, chat_types=[
-            constants.ChatType.GROUP, constants.ChatType.SUPERGROUP, constants.ChatType.PRIVATE
-        ]))
-        application.add_handler(CallbackQueryHandler(self.handle_callback_inline_query))
+        if self.config.get("proxy"):
+            builder = builder.proxy_url(self.config["proxy"]).get_updates_proxy_url(
+                self.config["proxy"]
+            )
+        application = builder.build()
 
-        application.add_error_handler(error_handler)
+        application.add_handler(CommandHandler("start", self.help))
+        application.add_handler(CommandHandler("help", self.help))
+        application.add_handler(CommandHandler("key", self.set_key))
+        application.add_handler(CommandHandler("keyinfo", self.key_info))
+        application.add_handler(CommandHandler("logout", self.logout))
+        application.add_handler(CommandHandler("models", self.models))
+        application.add_handler(CommandHandler("model", self.model))
+        application.add_handler(CommandHandler("imagemodels", self.image_models))
+        application.add_handler(CommandHandler("imagemodel", self.image_model))
+        application.add_handler(CommandHandler("image", self.image))
+        application.add_handler(CommandHandler("budget", self.budget))
+        application.add_handler(CommandHandler("stats", self.stats))
+        application.add_handler(CommandHandler("reset", self.reset))
+        application.add_handler(CommandHandler("resend", self.resend))
+        application.add_handler(
+            CommandHandler("chat", self.prompt, filters=filters.ChatType.GROUPS)
+        )
+        application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, self.photo))
+        application.add_handler(
+            MessageHandler(filters.Document.ALL & ~filters.Document.IMAGE, self.document)
+        )
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.prompt))
+        application.add_handler(
+            CallbackQueryHandler(self.model_callback, pattern=r"^model(?:pick|page):[ti]:\d+$")
+        )
+        application.add_error_handler(self.error_handler)
+        return application
 
-        application.run_polling()
+    def run(self) -> None:
+        """Run Telegram long polling until stopped."""
+        application = self.build_application()
+        application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -1,6 +1,15 @@
 .env
 .dockerignore
+.git
 .github
 .gitignore
+.venv
+.coverage
+.mypy_cache
+.pytest_cache
+.ruff_cache
+__pycache__
 docker-compose.yml
 Dockerfile
+usage_logs
+user_data
