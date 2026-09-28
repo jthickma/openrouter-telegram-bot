@@ -21,6 +21,18 @@ The bot does not require a shared inference key. User keys are validated against
 - Access controls for private and group chats.
 - Docker deployment as an unprivileged user with persistent non-secret settings and usage volumes.
 
+## Chat controls and model search
+
+Open `/menu` (or `/start`) for chat models, image models, system prompts, usage, and setup help.
+
+The model picker puts **Search models** at the top. Tap it and reply in Telegram's message field with a model or provider name, such as `claude` or `google flash`. All search words must match the model name or ID, regardless of case. Search works for both chat and image models and does not make an inference request or consume model tokens.
+
+Telegram does not support embedded text fields inside inline message keyboards. The search button opens its native reply composer with a search placeholder; results appear after you submit. No Mini App, web hosting, or BotFather inline-mode setup is required. Reply to the search prompt specifically; ordinary messages still go to your conversation. `/cancel` returns to the picker.
+
+Chat models have **All**, **Vision**, and **Files** input filters. Filters combine with your search; **Clear filters** restores the full list. Six models appear per page, the active model is labeled, and selection shows pricing, context size, and supported inputs. **Change model** returns to your results. Selecting a different chat model resets conversation history; selecting the already-active one preserves it.
+
+Picker buttons belong to the user and chat/topic that opened them. Opening a new picker of the same kind, changing filters, or submitting a search invalidates old result buttons so an old index cannot select a different model. After a bot restart, open a fresh picker.
+
 ## How the OpenRouter integration works
 
 | Bot action | OpenRouter behavior |

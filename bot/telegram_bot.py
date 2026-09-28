@@ -8,7 +8,9 @@ import io
 import logging
 import math
 import mimetypes
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +116,17 @@ class CatalogView:
     models: list[ModelInfo]
     query: str
     input_modality: str | None = None
+    token: str = field(default_factory=lambda: secrets.token_hex(4))
+
+    def matches(self) -> list[ModelInfo]:
+        """Match every search term and retain the selected capability filter."""
+        terms = self.query.casefold().split()
+        return [
+            model
+            for model in self.models
+            if (not self.input_modality or self.input_modality in model.input_modalities)
+            and all(term in f"{model.id} {model.name}".casefold() for term in terms)
+        ]
 
 
 @dataclass(slots=True)
@@ -129,7 +142,7 @@ class PendingTextBatch:
 class OpenRouterTelegramBot:
     """Telegram bot backed by each user's own OpenRouter API key."""
 
-    MODEL_PAGE_SIZE = 8
+    MODEL_PAGE_SIZE = 6
 
     def __init__(
         self,
@@ -142,10 +155,13 @@ class OpenRouterTelegramBot:
         self.state = state
         self.usage: dict[int | str, UsageTracker] = {}
         self.last_message: dict[tuple[int, str], str] = {}
-        self.catalog_views: dict[tuple[int, str], CatalogView] = {}
+        self.catalog_views: dict[tuple[int, str, str], CatalogView] = {}
+        self.model_searches: dict[tuple[int, str], tuple[str, str, int]] = {}
         self.pending_text_batches: dict[tuple[int, str, str], PendingTextBatch] = {}
         self.awaiting_system_prompts: set[tuple[int, str]] = set()
         self.commands = [
+            BotCommand("menu", "Open models, prompts, and usage controls"),
+            BotCommand("cancel", "Cancel model search"),
             BotCommand("help", "Show commands and setup instructions"),
             BotCommand("key", "Authenticate with your OpenRouter API key"),
             BotCommand("keyinfo", "Show OpenRouter key usage and limits"),
@@ -291,25 +307,42 @@ class OpenRouterTelegramBot:
 
     async def help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         """Show user workflow and commands."""
+        assert update.effective_message is not None
         text = (
-            "OpenRouter Telegram Bot\n\n"
-            "1. In this private chat, send /key followed by your OpenRouter API key.\n"
-            "2. Use /models and /model provider/model to choose any current chat model.\n"
-            "3. Use /system to set a system prompt for this chat or topic.\n"
-            "4. Send text, a supported image, a PDF, a text/code file, or another file "
-            "supported natively by the selected model.\n"
-            "5. Use /imagemodels, /imagemodel, and /image for OpenRouter image generation.\n\n"
-            "Budget and privacy:\n"
-            "• /budget 5 monthly sets a local $5 soft cap; /budget off disables it.\n"
-            "• /stats combines exact response costs with your OpenRouter key limit.\n"
-            "• Keys stay in process memory only and are lost on restart. /logout forgets yours.\n"
-            "• Set keys only in private chat. The bot tries to delete the /key message immediately.\n\n"
-            "Model filters: /models image finds vision models; /models file finds native "
-            "file-capable models; /models image claude also searches by name. PDFs work "
-            "with any text model through OpenRouter's file parser. Consecutive text chunks "
-            "sent within the batching window are combined into one request."
+            "<b>Get started</b>\n"
+            "Send /key followed by your OpenRouter API key in a private chat. "
+            "Then open /models, choose a model, and send a message.\n\n"
+            "<b>Choose a model</b>\n"
+            "/models · Browse or tap Search models\n"
+            "/imagemodels · Choose an image generator\n"
+            "/model provider/model · Select an exact model ID\n\n"
+            "<b>Your conversation</b>\n"
+            "/system · Edit instructions for this chat\n"
+            "/reset · Clear conversation history\n"
+            "/resend · Repeat your last prompt\n"
+            "/image description · Generate an image\n"
+            "You can also send photos, PDFs, and text/code files. "
+            "Use the Vision or Files filter for other supported inputs.\n\n"
+            "<b>Usage &amp; privacy</b>\n"
+            "/stats · View costs and key limits\n"
+            "/budget 5 monthly · Set a $5 local soft cap\n"
+            "/budget off · Disable your local cap\n"
+            "/logout · Forget your API key\n"
+            "Keys stay in memory and are lost on restart. The bot tries to delete key messages."
         )
-        await self._reply_text(update, text)
+        await update.effective_message.reply_text(
+            text,
+            parse_mode="HTML",
+            message_thread_id=get_thread_id(update),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Chat models", callback_data="menu:models"),
+                        InlineKeyboardButton("Menu", callback_data="menu:home"),
+                    ]
+                ]
+            ),
+        )
 
     async def set_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Validate and keep a user's OpenRouter API key only in memory."""
@@ -407,44 +440,47 @@ class OpenRouterTelegramBot:
             return arguments[0].lower(), " ".join(arguments[1:]).strip()
         return None, " ".join(arguments).strip()
 
+    def _catalog_key(self, update: Update, kind: str) -> tuple[int, str, str]:
+        return self._user_id(update), self._session_id(update), kind
+
     async def models(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Browse the live OpenRouter text-output model catalog."""
-        api_key = await self._preflight(update, context, enforce_budget=False)
-        if api_key is None:
-            return
-        input_modality, query = self._parse_model_filter(context.args)
-        try:
-            models = await self.openrouter.list_models(
-                api_key,
-                output_modality="text",
-                input_modality=input_modality,
-                query=query,
-            )
-        except OpenRouterError as exc:
-            await self._reply_text(update, str(exc))
-            return
-        self.catalog_views[(self._user_id(update), "text")] = CatalogView(
-            kind="text", models=models, query=query, input_modality=input_modality
-        )
-        await self._show_catalog_page(update, context, "text", 0)
+        """Open the searchable chat-model picker."""
+        modality, query = self._parse_model_filter(context.args or [])
+        await self._open_catalog(update, context, "text", query, modality)
 
     async def image_models(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Browse the live OpenRouter image-output model catalog."""
+        """Open the searchable image-model picker."""
+        await self._open_catalog(update, context, "image", " ".join(context.args or []))
+
+    async def _open_catalog(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        kind: str,
+        query: str = "",
+        modality: str | None = None,
+    ) -> None:
         api_key = await self._preflight(update, context, enforce_budget=False)
         if api_key is None:
             return
-        query = " ".join(context.args).strip()
         try:
-            models = await self.openrouter.list_models(
-                api_key, output_modality="image", query=query
-            )
+            models = await self.openrouter.list_models(api_key, output_modality=kind)
         except OpenRouterError as exc:
             await self._reply_text(update, str(exc))
             return
-        self.catalog_views[(self._user_id(update), "image")] = CatalogView(
-            kind="image", models=models, query=query
+        self.catalog_views[self._catalog_key(update, kind)] = CatalogView(
+            kind=kind, models=models, query=query[:200], input_modality=modality
         )
-        await self._show_catalog_page(update, context, "image", 0)
+        self.model_searches.pop((self._user_id(update), self._session_id(update)), None)
+        await self._show_catalog_page(update, context, kind, 0)
+
+    @staticmethod
+    def _catalog_button(
+        view: CatalogView, label: str, action: str, value: str = "0"
+    ) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            label, callback_data=f"catalog:{view.kind[0]}:{view.token}:{action}:{value}"
+        )
 
     async def _show_catalog_page(
         self,
@@ -455,91 +491,277 @@ class OpenRouterTelegramBot:
         *,
         edit: bool = False,
     ) -> None:
-        user_id = self._user_id(update)
-        view = self.catalog_views.get((user_id, kind))
-        if view is None:
-            await self._reply_text(
-                update, "Run /models or /imagemodels again to refresh the catalog."
-            )
-            return
-        total_pages = max(1, math.ceil(len(view.models) / self.MODEL_PAGE_SIZE))
-        page = min(max(page, 0), total_pages - 1)
+        assert update.effective_message is not None
+        view = self.catalog_views[self._catalog_key(update, kind)]
+        models = view.matches()
+        pages = max(1, math.ceil(len(models) / self.MODEL_PAGE_SIZE))
+        page = min(max(page, 0), pages - 1)
         first = page * self.MODEL_PAGE_SIZE
-        visible = view.models[first : first + self.MODEL_PAGE_SIZE]
-        current = (
-            self.state.preferences_for(user_id).model
-            if kind == "text"
-            else self.state.preferences_for(user_id).image_model
-        )
-        filter_text = f" • input={view.input_modality}" if view.input_modality else ""
-        query_text = f" • search={view.query}" if view.query else ""
-        text = (
-            f"OpenRouter {'chat' if kind == 'text' else 'image'} models "
-            f"({len(view.models)} results{filter_text}{query_text})\n"
-            f"Page {page + 1}/{total_pages} • current: {current or 'not selected'}"
-        )
-        rows: list[list[InlineKeyboardButton]] = []
-        for index, model in enumerate(visible, start=first):
-            label = f"✓ {model.name}" if model.id == current else model.name
+        visible = models[first : first + self.MODEL_PAGE_SIZE]
+        preferences = self.state.preferences_for(self._user_id(update))
+        current = preferences.model if kind == "text" else preferences.image_model
+        title = "Chat models" if kind == "text" else "Image models"
+        text = f"<b>{title}</b>\nActive: <code>{escape(current or 'None selected')}</code>"
+        if view.query:
+            text += f"\nSearch: <b>{escape(view.query)}</b>"
+        if view.input_modality:
+            text += f"\nAccepts: {view.input_modality}"
+        if models:
+            text += (
+                f"\n\n{len(models):,} models · Page {page + 1} of {pages}\nChoose a model below."
+            )
+        else:
+            text += "\n\nNo models found. Try a model or provider name, or clear your filters."
+
+        def button(label: str, action: str, value: str = "0") -> InlineKeyboardButton:
+            return self._catalog_button(view, label, action, value)
+
+        rows = [[button("Search models" if not view.query else "Edit search", "search")]]
+        if kind == "text":
             rows.append(
-                [InlineKeyboardButton(label[:55], callback_data=f"modelpick:{kind[0]}:{index}")]
+                [
+                    button(
+                        ("Selected: " if view.input_modality == modality else "") + label,
+                        "filter",
+                        modality or "all",
+                    )
+                    for label, modality in [("All", None), ("Vision", "image"), ("Files", "file")]
+                ]
             )
-        navigation: list[InlineKeyboardButton] = []
+        for index, model in enumerate(visible, start=first):
+            label = model.name
+            if len(label) > 48:
+                label = label[:47].rstrip() + "…"
+            if model.id == current:
+                label = "Active · " + label
+            rows.append([button(label, "pick", str(index))])
+        navigation = []
         if page > 0:
-            navigation.append(
-                InlineKeyboardButton("‹ Previous", callback_data=f"modelpage:{kind[0]}:{page - 1}")
-            )
-        if page + 1 < total_pages:
-            navigation.append(
-                InlineKeyboardButton("Next ›", callback_data=f"modelpage:{kind[0]}:{page + 1}")
-            )
+            navigation.append(button("‹ Back", "page", str(page - 1)))
+        if page + 1 < pages:
+            navigation.append(button("Next ›", "page", str(page + 1)))
         if navigation:
             rows.append(navigation)
-        markup = InlineKeyboardMarkup(rows) if rows else None
-        if not visible:
-            text += "\nNo matching models. Try a broader search."
+        footer = []
+        if view.query or view.input_modality:
+            footer.append(button("Clear filters", "clear"))
+        footer.extend(
+            [InlineKeyboardButton("Menu", callback_data="menu:home"), button("Close", "close")]
+        )
+        rows.append(footer)
+        markup = InlineKeyboardMarkup(rows)
         if edit and update.callback_query:
-            await update.callback_query.edit_message_text(text=text, reply_markup=markup)
+            try:
+                await update.callback_query.edit_message_text(
+                    text=text, reply_markup=markup, parse_mode="HTML"
+                )
+            except BadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
         else:
-            await update.effective_message.reply_text(text=text, reply_markup=markup)
+            await update.effective_message.reply_text(
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+                message_thread_id=get_thread_id(update),
+            )
 
     async def model_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle catalog paging and model selection buttons."""
+        """Bind picker actions to their owner, chat/topic, and catalog snapshot."""
         query = update.callback_query
         if query is None or query.data is None:
             return
-        await query.answer()
         parts = query.data.split(":")
-        if len(parts) != 3:
+        if len(parts) != 5:
+            await query.answer("This picker expired. Open /models again.")
             return
-        action, short_kind, raw_value = parts
+        _, short_kind, token, action, value = parts
         kind = "text" if short_kind == "t" else "image"
-        try:
-            value = int(raw_value)
-        except ValueError:
-            return
-        view = self.catalog_views.get((self._user_id(update), kind))
-        if view is None:
-            await query.edit_message_text(
-                "This catalog expired. Run /models or /imagemodels again."
+        view = self.catalog_views.get(self._catalog_key(update, kind))
+        if view is None or view.token != token:
+            await query.answer(
+                "Open your own current picker with /models or /imagemodels.", show_alert=True
             )
             return
-        if action == "modelpage":
-            await self._show_catalog_page(update, context, kind, value, edit=True)
+        await query.answer()
+        if await self._preflight(update, context, enforce_budget=False) is None:
             return
-        if action != "modelpick" or value < 0 or value >= len(view.models):
+        if (
+            self.catalog_views.get(self._catalog_key(update, kind)) is not view
+            or view.token != token
+        ):
             return
-        model = view.models[value]
+        session_key = (self._user_id(update), self._session_id(update))
+        if action == "search":
+            assert update.effective_message is not None
+            message = await update.effective_message.reply_text(
+                f'Search models\n\n<a href="tg://user?id={self._user_id(update)}">Reply</a> with a model or provider name, such as “claude” or “google flash”.\nUse /cancel to return to the list.',
+                parse_mode="HTML",
+                reply_markup=ForceReply(
+                    selective=True, input_field_placeholder="Search models or providers"
+                ),
+                message_thread_id=get_thread_id(update),
+            )
+            if (
+                self.catalog_views.get(self._catalog_key(update, kind)) is view
+                and view.token == token
+            ):
+                self.model_searches[session_key] = (kind, token, message.message_id)
+            return
+        self.model_searches.pop(session_key, None)
+        if action == "close":
+            self.catalog_views.pop(self._catalog_key(update, kind), None)
+            await query.edit_message_text("Model picker closed. Send a message to keep chatting.")
+            return
+        if action in {"clear", "filter"}:
+            if action == "clear":
+                view.query, view.input_modality = "", None
+            elif value in {"all", "image", "file"}:
+                view.input_modality = None if value == "all" else value
+            # Rotate callbacks whenever indices can refer to a different result set.
+            view.token = secrets.token_hex(4)
+            await self._show_catalog_page(update, context, kind, 0, edit=True)
+            return
+        if not value.isdigit():
+            return
+        index = int(value)
+        if action == "page":
+            await self._show_catalog_page(update, context, kind, index, edit=True)
+            return
+        models = view.matches()
+        if action != "pick" or index >= len(models):
+            return
+        model = models[index]
         if kind == "text":
-            self.state.set_model(self._user_id(update), model.id)
-            self.openrouter.reset_user_history(self._user_id(update))
+            if self.state.preferences_for(self._user_id(update)).model != model.id:
+                self.state.set_model(self._user_id(update), model.id)
+                self.openrouter.reset_user_history(self._user_id(update))
         else:
             self.state.set_image_model(self._user_id(update), model.id)
-        await query.edit_message_text(
-            f"Selected {model.name}\n{model.id}\n{model.price_summary()}\n"
-            f"Input: {', '.join(sorted(model.input_modalities))} • "
-            f"Output: {', '.join(sorted(model.output_modalities))}"
+        next_step = (
+            "Send a message to start chatting."
+            if kind == "text"
+            else "Use /image followed by what you want to create."
         )
+        await query.edit_message_text(
+            f"<b>{escape(model.name)}</b>\nActive {'chat' if kind == 'text' else 'image'} model\n\n"
+            f"{escape(model.price_summary())}\nContext: {model.context_length:,} tokens\n"
+            f"Accepts: {escape(', '.join(sorted(model.input_modalities)))}\n\n{next_step}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        self._catalog_button(
+                            view, "Change model", "page", str(index // self.MODEL_PAGE_SIZE)
+                        ),
+                        InlineKeyboardButton("Menu", callback_data="menu:home"),
+                    ]
+                ]
+            ),
+        )
+
+    async def _model_search_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Consume only replies to the active search prompt, never ordinary chat."""
+        assert update.effective_message is not None
+        key = (self._user_id(update), self._session_id(update))
+        pending = self.model_searches.get(key)
+        reply = update.effective_message.reply_to_message
+        if not pending or not reply or reply.message_id != pending[2]:
+            if (
+                reply
+                and reply.from_user
+                and reply.from_user.id == context.bot.id
+                and (reply.text or "").startswith("Search models\n\n")
+            ):
+                await self._reply_text(
+                    update, "This search expired. Open /models or /imagemodels again."
+                )
+                return True
+            return False
+        kind, token, _ = pending
+        view = self.catalog_views.get(self._catalog_key(update, kind))
+        if view is None or view.token != token:
+            self.model_searches.pop(key, None)
+            await self._reply_text(
+                update, "This search expired. Open /models or /imagemodels again."
+            )
+            return True
+        if await self._preflight(update, context, enforce_budget=False) is None:
+            return True
+        if (
+            self.model_searches.get(key) != pending
+            or self.catalog_views.get(self._catalog_key(update, kind)) is not view
+            or view.token != token
+        ):
+            return True
+        term = (update.effective_message.text or "").strip()
+        if not term or len(term) > 200:
+            await self._reply_text(
+                update,
+                "Keep your search between 1 and 200 characters. Reply to the search prompt again.",
+            )
+            return True
+        view.query = term
+        view.token = secrets.token_hex(4)
+        self.model_searches.pop(key, None)
+        await self._show_catalog_page(update, context, kind, 0)
+        return True
+
+    async def cancel_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Return from model search without changing the selected model."""
+        pending = self.model_searches.pop((self._user_id(update), self._session_id(update)), None)
+        if pending and self._catalog_key(update, pending[0]) in self.catalog_views:
+            await self._show_catalog_page(update, context, pending[0], 0)
+        else:
+            await self._reply_text(
+                update, "No model search is open. Use /models to choose a model."
+            )
+
+    async def menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show a compact home screen with the main controls."""
+        assert update.effective_message is not None
+        if await self._preflight(update, context, require_key=False, enforce_budget=False) != "":
+            return
+        preferences = self.state.preferences_for(self._user_id(update))
+        rows = [
+            [
+                InlineKeyboardButton("Chat models", callback_data="menu:models"),
+                InlineKeyboardButton("Image models", callback_data="menu:images"),
+            ],
+            [
+                InlineKeyboardButton("System prompt", callback_data="menu:system"),
+                InlineKeyboardButton("Usage & budget", callback_data="menu:stats"),
+            ],
+            [InlineKeyboardButton("Help & setup", callback_data="menu:help")],
+        ]
+        await update.effective_message.reply_text(
+            "<b>OpenRouter</b>\n\n"
+            f"Chat · <code>{escape(preferences.model)}</code>\n"
+            f"Images · <code>{escape(preferences.image_model or 'None selected')}</code>\n\n"
+            "Choose a control below, or send a message to chat.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+            message_thread_id=get_thread_id(update),
+        )
+
+    async def menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+        action = query.data.removeprefix("menu:")
+        if action in {"models", "images"}:
+            await self._open_catalog(update, context, "text" if action == "models" else "image")
+        elif action == "system":
+            if (
+                await self._preflight(update, context, require_key=False, enforce_budget=False)
+                == ""
+            ):
+                await self._show_system_prompt(update)
+        else:
+            handler = {"home": self.menu, "stats": self.stats, "help": self.help}.get(action)
+            if handler:
+                await handler(update, context)
 
     async def model(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Show or select an exact OpenRouter chat-model slug."""
@@ -628,6 +850,11 @@ class OpenRouterTelegramBot:
                 await self._apply_system_prompt(update, supplied_prompt)
             return
 
+        await self._show_system_prompt(update)
+
+    async def _show_system_prompt(self, update: Update) -> None:
+        """Render the current system prompt without interpreting a command."""
+        assert update.effective_message is not None
         custom_prompt = self.state.system_prompt_for(
             self._user_id(update), self._session_id(update)
         )
@@ -913,6 +1140,8 @@ class OpenRouterTelegramBot:
         """Queue a Telegram text message for one debounced OpenRouter request."""
         if update.edited_message or not update.message or update.message.via_bot:
             return
+        if await self._model_search_reply(update, context):
+            return
         prompt = message_text(update.message)
         session_key = (self._user_id(update), self._session_id(update))
         entering_system_prompt = session_key in self.awaiting_system_prompts
@@ -1192,7 +1421,9 @@ class OpenRouterTelegramBot:
             )
         application = builder.build()
 
-        application.add_handler(CommandHandler("start", self.help))
+        application.add_handler(CommandHandler("start", self.menu))
+        application.add_handler(CommandHandler("menu", self.menu))
+        application.add_handler(CommandHandler("cancel", self.cancel_search))
         application.add_handler(CommandHandler("help", self.help))
         application.add_handler(CommandHandler("key", self.set_key))
         application.add_handler(CommandHandler("keyinfo", self.key_info))
@@ -1216,13 +1447,14 @@ class OpenRouterTelegramBot:
         )
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.prompt))
         application.add_handler(
-            CallbackQueryHandler(self.model_callback, pattern=r"^model(?:pick|page):[ti]:\d+$")
+            CallbackQueryHandler(self.model_callback, pattern=r"^(?:catalog:|model(?:pick|page):)")
         )
         application.add_handler(
             CallbackQueryHandler(
                 self.system_prompt_callback, pattern=r"^systemprompt:(?:set|reset)$"
             )
         )
+        application.add_handler(CallbackQueryHandler(self.menu_callback, pattern=r"^menu:"))
         application.add_error_handler(self.error_handler)
         return application
 
